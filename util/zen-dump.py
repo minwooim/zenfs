@@ -53,13 +53,14 @@ def file_symbol(id):
     return DISPLAY_CHARACTERS[id % len(DISPLAY_CHARACTERS)]
 
 
+parser = cysimdjson.JSONParser()
+d = None
+with open('result.json', 'rb') as f:
+    d = f.read()
+data_ = parser.parse(d)
 def load_data(json_file):
-    print("loading data...")
-    with open(json_file, 'rb') as f:
-        parser = cysimdjson.JSONParser()
-        data = parser.parse(f.read())
-    print("processing data...")
-    return data
+    global data_
+    return data_
 
 
 def size_human(value):
@@ -212,6 +213,7 @@ def main(argv):
     if cmd == 'zones':
         cmd_zones(load_data(json_file))
     elif cmd == 'files':
+        data = load_data(json_file)
         cmd_files(load_data(json_file))
     elif cmd == 'extents':
         cmd_extents(load_data(json_file))
