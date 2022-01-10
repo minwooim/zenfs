@@ -249,6 +249,10 @@ ZenFS::~ZenFS() {
   zbd_->LogZoneUsage();
   LogFiles();
 
+  // log zone striping group information here
+  zbd_->LogZSGPQ();
+  zbd_->LogImmutableGroups();
+
   meta_log_.reset(nullptr);
   ClearFiles();
   delete zbd_;
@@ -445,6 +449,7 @@ IOStatus ZenFS::DeleteFile(std::string fname) {
       /* Failed to persist the delete, return to a consistent state */
       files_.insert(std::make_pair(fname.c_str(), zoneFile));
     } else {
+      zoneFile->deleted_ = true;
       zoneFile.reset();
     }
   } else {
@@ -1111,17 +1116,19 @@ std::map<std::string, Env::WriteLifeTimeHint> ZenFS::GetWriteLifeTimeHints() {
 #ifndef NDEBUG
 static std::string GetLogFilename(std::string bdev) {
   std::ostringstream ss;
-  time_t t = time(0);
-  struct tm* log_start = std::localtime(&t);
-  char buf[40];
+  // time_t t = time(0);
+  // struct tm* log_start = std::localtime(&t);
+  // char buf[40];
 
-  std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H:%M:%S.log", log_start);
-  ss << DEFAULT_ZENV_LOG_PATH << std::string("zenfs_") << bdev << "_" << buf;
+  // std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H:%M:%S.log", log_start);
+  // ss << DEFAULT_ZENV_LOG_PATH << std::string("zenfs_") << bdev << "_" << buf;
+  ss << DEFAULT_ZENV_LOG_PATH << std::string("zenfs_") << bdev << ".log";
 
   return ss.str();
 }
 #endif
 
+std::shared_ptr<Logger> _logger;
 Status NewZenFS(FileSystem** fs, const std::string& bdevname,
                 std::shared_ptr<ZenFSMetrics> metrics) {
   std::shared_ptr<Logger> logger;
@@ -1134,6 +1141,8 @@ Status NewZenFS(FileSystem** fs, const std::string& bdevname,
   } else {
     logger->SetInfoLogLevel(DEBUG_LEVEL);
   }
+
+  _logger = logger;
 #endif
 
   ZonedBlockDevice* zbd = new ZonedBlockDevice(bdevname, logger, metrics);

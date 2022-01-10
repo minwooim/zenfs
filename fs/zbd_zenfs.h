@@ -6,8 +6,6 @@
 
 #pragma once
 
-#if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
-
 #include <errno.h>
 #include <libzbd/zbd.h>
 #include <stdlib.h>
@@ -22,21 +20,40 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <queue>
 
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "port/port_posix.h"
+#include "util/aligned_buffer.h"
+
+// Number of zones being striped for a SSTable
+#define ZSG_ZONES         (128)  // --write_buffer_size / --target_file_size_base
+// Number of SSTables in a single zone.
+#define ZSG_FILES         (1)  // 1 or ZSG_ZONES
+// Size of a buffer for a zone striping group
+#define ZSG_ZONE_SIZE     (96 * 1024 * 1024)
+#define ZSG_PER_ZONE_BUFFER   (ZSG_ZONE_SIZE / ZSG_FILES)
+// Actual size of a SSTable
+#define ZSG_BUFFER_SIZE   ((size_t) ZSG_PER_ZONE_BUFFER * (size_t) ZSG_ZONES)
+#define ZSG_ZONE_LIMIT    (256)
+#define ZSG_MAX_OPEN_GROUP (ZSG_ZONE_LIMIT / ZSG_ZONES)
+
+#define ZSG_START_ZONE    (1024)
 
 namespace ROCKSDB_NAMESPACE {
 
 class ZonedBlockDevice;
 class ZoneSnapshot;
+class ZoneFile;
+class ZoneStripingGroup;
 
 class Zone {
+ public:
   ZonedBlockDevice *zbd_;
   std::atomic_bool busy_;
 
- public:
   explicit Zone(ZonedBlockDevice *zbd, struct zbd_zone *z);
 
   uint64_t start_;
@@ -45,6 +62,11 @@ class Zone {
   uint64_t wp_;
   Env::WriteLifeTimeHint lifetime_;
   std::atomic<long> used_capacity_;
+
+  // This is only for ZSG.
+  // We can have this here in Zone because a single zone can have exactly
+  // N SST files.
+  uint64_t extent_start_;
 
   IOStatus Reset();
   IOStatus Finish();
@@ -73,6 +95,163 @@ class Zone {
   IOStatus CloseWR(); /* Done writing */
 
   inline IOStatus CheckRelease();
+
+  int id_;
+  inline uint64_t GetZoneId() {
+    return id_;
+  }
+
+  inline uint64_t GetStartLBA() {
+    // XXX: Should get LBA size of this block device
+    return start_ / 4096;
+  }
+
+  inline uint64_t GetWritePointer() {
+    return wp_;
+  }
+};
+
+enum class ZSGState {
+  kEmpty              = 0,
+  kPartialInprogress  = 1,
+  kPartialIdle        = 2,
+  kFull               = 3,
+};
+
+class ZoneStripingGroup {
+ public:
+  ZonedBlockDevice *zbd_;
+  ZSGState state_;
+  int nr_zones_;
+  int id_;
+  int current_nr_zones_;
+  std::vector<Zone *> zones_;
+  std::shared_ptr<Logger> logger_;
+
+  std::vector<std::thread> thread_pool_;
+
+  // Number of current SST files written
+
+  std::vector<AlignedBuffer *> buffers_;
+
+  // Two cases where this variable is updated:
+  //   (1) ZonedBlockDevice::AllocateZoneStripingGroup
+  //   (2) ZoneFile::~ZoneFile()
+  std::atomic<int> current_sst_files_;
+  // Number of total SSTables whether or not it's removed.  This value will not
+  // be reset until this group is destroyed (all SSTables are removed).
+  int total_sst_files_;
+
+  ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
+      std::shared_ptr<Logger> logger) {
+    zbd_ = zbd;
+    state_ = ZSGState::kEmpty;
+    nr_zones_ = nr_zones;
+    id_ = id;
+    current_nr_zones_ = 0;
+    zones_.resize(nr_zones);
+    logger_ = logger;
+
+    thread_pool_.reserve(nr_zones);
+
+    current_sst_files_ = 0;
+    total_sst_files_ = 0;
+
+    // nr_zones == number of files in a zone
+    buffers_.resize(nr_zones);
+  }
+
+  ~ZoneStripingGroup();
+
+  uint64_t GetId() {
+    return id_;
+  }
+
+  int GetNumZones() {
+    return nr_zones_;
+  }
+
+  Zone *GetZone(int id) {
+    return zones_[id];
+  }
+
+  void AddZone(Zone *zone) {
+    zones_[current_nr_zones_++] = zone;
+    Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
+        id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
+  }
+
+  bool IsFull() {
+    return ZSG_FILES == total_sst_files_;
+  }
+
+  ZSGState GetState() {
+    return state_;
+  }
+
+  void SetState(ZSGState state) {
+    switch (state_) {
+      case ZSGState::kEmpty:
+        if (state == ZSGState::kPartialInprogress) {
+          break;
+        }
+        [[fallthrough]];
+      case ZSGState::kPartialInprogress:
+        if (state == ZSGState::kPartialIdle ||
+            state == ZSGState::kFull) {
+          break;
+        }
+        [[fallthrough]];
+      case ZSGState::kPartialIdle:
+        if (state == ZSGState::kPartialInprogress ||
+            state == ZSGState::kFull) {
+          break;
+        }
+        [[fallthrough]];
+      case ZSGState::kFull:
+        if (state == ZSGState::kEmpty) {
+          break;
+        }
+        [[fallthrough]];
+      default:
+        assert(false);
+        return;
+    }
+
+    state_ = state;
+  }
+
+  // IOStatus BGWorkAppend(int i, char *data, size_t size);
+  void Append(int id, void *data, size_t size);
+  void Fsync(ZoneFile *zonefile, int id);
+  void PushExtents(ZoneFile *zonefile);
+};
+
+template <typename T>
+class ZoneStripingGroupQueue {
+  public:
+    std::mutex mtx;
+    std::queue<T> queue;
+
+    void push(T const & value) {
+      mtx.lock();
+      queue.push(value);
+      mtx.unlock();
+    }
+
+    bool pop(T & value) {
+      mtx.lock();
+      if (queue.empty()) {
+        mtx.unlock();
+        return false;
+      }
+
+      value = queue.front();
+      queue.pop();
+      mtx.unlock();
+
+      return true;
+    }
 };
 
 class ZonedBlockDevice {
@@ -81,6 +260,8 @@ class ZonedBlockDevice {
   uint32_t block_sz_;
   uint64_t zone_sz_;
   uint32_t nr_zones_;
+  std::queue<ZoneStripingGroup *> zsgq_;
+  std::queue<ZoneStripingGroup *> zsgpq_; // partial queue
   std::vector<Zone *> io_zones;
   std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
@@ -155,11 +336,24 @@ class ZonedBlockDevice {
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 
+  ZoneStripingGroup *AllocateZoneStripingGroup(int *id);
+  void PushToZSGPartialQueue(ZoneStripingGroup *zsg);
+  void LogZSGPQ();
+  void LogImmutableGroups();
+
+  inline void PushToZSGQ(ZoneStripingGroup *zsg) {
+    zsgq_.push(zsg);
+  };
+
+  // number of active zones (open, closed) within ZSG
+  std::atomic<int> nr_active_zsgs_;
+  std::mutex zsgq_push_mtx_;
+  std::mutex zsgpq_push_mtx_;
+  std::mutex zsgq_pop_mtx_;
+
  private:
   std::string ErrorToString(int err);
   IOStatus GetZoneDeferredStatus();
 };
 
 }  // namespace ROCKSDB_NAMESPACE
-
-#endif  // !defined(ROCKSDB_LITE) && defined(OS_LINUX)

@@ -25,8 +25,11 @@
 
 #include "rocksdb/env.h"
 #include "util/coding.h"
+#include "logging/logging.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+extern std::shared_ptr<Logger> _logger;
 
 ZoneExtent::ZoneExtent(uint64_t start, uint32_t length, Zone* zone)
     : start_(start), length_(length), zone_(zone) {}
@@ -202,7 +205,13 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
       filename_(filename),
       file_id_(file_id),
       nr_synced_extents_(0),
-      m_time_(0) {}
+      m_time_(0),
+      deleted_(false) {
+
+        zsg_ = nullptr;
+        Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
+
+      }
 
 std::string ZoneFile::GetFilename() { return filename_; }
 void ZoneFile::Rename(std::string name) { filename_ = name; }
@@ -220,9 +229,37 @@ ZoneFile::~ZoneFile() {
     zone->used_capacity_ -= (*e)->length_;
     delete *e;
   }
+
+  if (zsg_ && deleted_) {
+    ROCKS_LOG_INFO(_logger, "deleted file=%s, current_sst_files=%d",
+        filename_.c_str(), zsg_->current_sst_files_.load());
+    zsg_->current_sst_files_--;
+    assert(zsg_->current_sst_files_.load() >= 0);
+
+    // When it reaches to zero, it means this group has no more files in it.
+    // We don't GC here, so just reset the zone here and put it into normal
+    // zone striping group queue.
+    if (!zsg_->current_sst_files_.load()) {
+      // destroy this zone striping group
+      ROCKS_LOG_INFO(_logger, "destroy zsg %d",
+          zsg_->id_);
+      for (int i = 0; i < zsg_->nr_zones_; i++) {
+        Zone *zone = zsg_->zones_[i];
+        zone->Reset();
+      }
+    }
+  }
+
   IOStatus s = CloseWR();
   if (!s.ok()) {
     zbd_->SetZoneDeferredStatus(s);
+  }
+
+  if (zsg_ && deleted_ && !zsg_->current_sst_files_.load()) {
+    zsg_->zbd_->zsgq_push_mtx_.lock();
+    zsg_->zbd_->PushToZSGQ(zsg_);
+    zsg_->total_sst_files_ = 0;
+    zsg_->zbd_->zsgq_push_mtx_.unlock();
   }
 }
 
@@ -282,6 +319,8 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
   IOStatus s;
 
   if (offset >= fileSize) {
+    ROCKS_LOG_ERROR(_logger, "%s positioned read failed: offset=%ld >= fileSize=%ld",
+        filename_.c_str(), offset, fileSize);
     *result = Slice(scratch, 0);
     return IOStatus::OK();
   }
@@ -290,6 +329,8 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
   extent = GetExtent(offset, &r_off);
   if (!extent) {
     /* read start beyond end of (synced) file data*/
+    ROCKS_LOG_ERROR(_logger, "%s failed to get a extent: offset=%ld",
+        filename_.c_str(), offset);
     *result = Slice(scratch, 0);
     return s;
   }
@@ -368,6 +409,24 @@ void ZoneFile::PushExtent() {
   active_zone_->used_capacity_ += length;
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = fileSize;
+
+  ROCKS_LOG_INFO(_logger, "ZoneFile::PushExtent(): filename=%s, zone[%ld] used_capacity_=%ld",
+		  filename_.c_str(),
+		  active_zone_->start_ / active_zone_->max_capacity_,
+		  active_zone_->used_capacity_.load());
+}
+
+void ZoneFile::Append(void *data, int data_size) {
+  if (!zsg_) {
+    int id;
+    zsg_ = zbd_->AllocateZoneStripingGroup(&id);
+    ROCKS_LOG_INFO(_logger, "%s zone striping group %ld allocated",
+        filename_.c_str(), zsg_->GetId());
+    id_in_zsg_ = id;
+  }
+
+  zsg_->Append(id_in_zsg_, data, data_size);
+  fileSize += data_size;
 }
 
 /* Assumes that data and size are block aligned */
@@ -419,6 +478,14 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
     wr_size = left;
     if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
 
+    Debug(_logger, "ZoneFile::Append(), zone[%ld] start=0x%lx, wp=0x%lx, cap=0x%lx, used_cap=0x%lx, wr_size=%d",
+		    active_zone_->start_ / active_zone_->max_capacity_,
+		    active_zone_->start_,
+		    active_zone_->wp_,
+		    active_zone_->capacity_,
+		    active_zone_->used_capacity_.load(),
+		    wr_size);
+
     s = active_zone_->Append((char*)data + offset, wr_size);
     if (!s.ok()) return s;
 
@@ -433,6 +500,8 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
 
 IOStatus ZoneFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime) {
   lifetime_ = lifetime;
+  Debug(_logger, "ZoneFile::SetWriteLifeTimeHint(): file=%s, lifetime=%d",
+        filename_.c_str(), lifetime_);
   return IOStatus::OK();
 }
 
@@ -497,6 +566,15 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
                                   IODebugContext* /*dbg*/) {
   IOStatus s;
 
+  Debug(_logger, "ZonedWritableFile::Fsync(): file=%s",
+		  zoneFile_->getFilename().c_str());
+
+  // Finish (actual write to zones) zone group
+  // We need to keep going for the last footer metdata blocks.
+  if (zoneFile_->InZSG()) {
+    zoneFile_->Fsync();
+  }
+
   buffer_mtx_.lock();
   s = FlushBuffer();
   buffer_mtx_.unlock();
@@ -510,6 +588,8 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
 
 IOStatus ZonedWritableFile::Sync(const IOOptions& options,
                                  IODebugContext* dbg) {
+  Debug(_logger, "ZonedWritableFile::Sync(): file=%s",
+		  zoneFile_->getFilename().c_str());
   return Fsync(options, dbg);
 }
 
@@ -528,6 +608,7 @@ IOStatus ZonedWritableFile::RangeSync(uint64_t offset, uint64_t nbytes,
 
 IOStatus ZonedWritableFile::Close(const IOOptions& options,
                                   IODebugContext* dbg) {
+  Debug(_logger, "ZonedWritableFile::Close(): Closing ...");
   Fsync(options, dbg);
   return zoneFile_->CloseWR();
 }
@@ -536,6 +617,8 @@ IOStatus ZonedWritableFile::FlushBuffer() {
   uint32_t align, pad_sz = 0, wr_sz;
   IOStatus s;
 
+  Debug(_logger, "ZonedWritableFile::FlushBuffer(): file=%s",
+		  zoneFile_->getFilename().c_str());
   if (!buffer_pos) return IOStatus::OK();
 
   align = buffer_pos % block_sz;
@@ -631,26 +714,13 @@ IOStatus ZonedWritableFile::Append(const Slice& data,
   return s;
 }
 
-IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t offset,
+IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t /*offset*/,
                                              const IOOptions& /*options*/,
                                              IODebugContext* /*dbg*/) {
-  IOStatus s;
-
-  if (offset != wp) {
-    assert(false);
-    return IOStatus::IOError("positioned append not at write pointer");
-  }
-
-  if (buffered) {
-    buffer_mtx_.lock();
-    s = BufferedWrite(data);
-    buffer_mtx_.unlock();
-  } else {
-    s = zoneFile_->Append((void*)data.data(), data.size(), data.size());
-    if (s.ok()) wp += data.size();
-  }
-
-  return s;
+  // We can say that this case is only for sst files.
+  zoneFile_->Append((void *) data.data(), data.size());
+  wp += data.size();
+  return IOStatus::OK();
 }
 
 void ZonedWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
@@ -714,6 +784,12 @@ size_t ZoneFile::GetUniqueId(char* id, size_t max_size) {
 
 size_t ZonedRandomAccessFile::GetUniqueId(char* id, size_t max_size) const {
   return zoneFile_->GetUniqueId(id, max_size);
+}
+
+void ZoneFile::Fsync() {
+  zsg_->Fsync(this, id_in_zsg_);
+
+  ROCKS_LOG_INFO(_logger, "file %s (size=%ld)", filename_.c_str(), fileSize);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
