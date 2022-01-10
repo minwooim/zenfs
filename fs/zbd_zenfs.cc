@@ -46,6 +46,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+extern std::shared_ptr<Logger> _logger;
+
 Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
     : zbd_(zbd),
       busy_(false),
@@ -57,6 +59,10 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
   capacity_ = 0;
   if (!(zbd_zone_full(z) || zbd_zone_offline(z) || zbd_zone_rdonly(z)))
     capacity_ = zbd_zone_capacity(z) - (zbd_zone_wp(z) - zbd_zone_start(z));
+
+  Debug(_logger, "Zone::Zone(): zone[%ld] start_=0x%lx, used_capacity_=0x%lx",
+        this->start_ / this->max_capacity_, this->start_,
+        this->used_capacity_.load());
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -111,6 +117,9 @@ IOStatus Zone::Reset() {
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
 
+  Debug(_logger, "Zone::Reset(): Reset zone[%ld]",
+        this->start_ / this->max_capacity_);
+
   return IOStatus::OK();
 }
 
@@ -127,6 +136,9 @@ IOStatus Zone::Finish() {
   capacity_ = 0;
   wp_ = start_ + zone_sz;
 
+  Debug(_logger, "Zone::Finish(): Finish zone[%ld]",
+        this->start_ / this->max_capacity_);
+
   return IOStatus::OK();
 }
 
@@ -141,6 +153,9 @@ IOStatus Zone::Close() {
     ret = zbd_close_zones(fd, start_, zone_sz);
     if (ret) return IOStatus::IOError("Zone close failed\n");
   }
+
+  Debug(_logger, "Zone::Finish(): Close zone[%ld]",
+        this->start_ / this->max_capacity_);
 
   return IOStatus::OK();
 }
@@ -542,17 +557,38 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
   /* Reset any unused zones and finish used zones under capacity treshold*/
   for (const auto z : io_zones) {
     if (!z->Acquire()) {
+      Debug(
+          _logger,
+          "ZonedBlockDevice::AllocateZone(): Failed to acquire. skip zone[%ld]",
+          z->start_ / z->max_capacity_);
       continue;
     }
 
+    // 이 부분부터는 해당 zone (z) 가 busy_ = true 되어 있는 상태!
+    // (1) Empty zone 인 경우 (start == wp), busy_ = false 로 busy clear 함!
+    // (2) Full 이고 Used 인 경우 (진짜 full), 동일하게 busy clearing!
+    //     -> Full 이고 Used 가 아닌 경우, cap 자체가 0 인 zone... ? (애초부터
+    //     사용 불가 존 ?)
     if (z->IsEmpty() || (z->IsFull() && z->IsUsed())) {
       IOStatus status = z->CheckRelease();
       if (!status.ok()) return status;
       continue;
     }
 
+    // "zone 에 있는 파일들이 모두 지워진 경우"
+    // 여기서부턴 조금이라도 쓰인 (partially written) zone 의 경우만 해당됨.
+    // 하지만 !IsUsed() 인 경우는 ZoneFile::~ZoneFile() 이 불려서 used_capacity_
+    // 가 0 이 된 경우 즉, 다 사용한 file 로 invalid 한 file 을 의미함.
     if (!z->IsUsed()) {
+      // capacity_ == 0 인 경우를 의미함
       if (!z->IsFull()) active_io_zones_--;
+
+      // 이 경우는 쓰다가 rename file, delete file 혹은 ~ZoneFile() 을 만나서
+      // free 된 경우
+      Debug(_logger,
+            "ZonedBlockDevice::AllocateZone(): Not used zone. reset zone[%ld], "
+            "used_capacity_=0x%lx",
+            z->start_ / z->max_capacity_, z->used_capacity_.load());
       s = z->Reset();
       if (!s.ok()) {
         Debug(logger_, "Failed resetting zone !");
@@ -564,58 +600,64 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
       continue;
     }
 
-    if ((z->capacity_ < (z->max_capacity_ * finish_threshold_ / 100))) {
-      /* If there is less than finish_threshold_% remaining capacity in a
-       * non-open-zone, finish the zone */
-      s = z->Finish();
-      if (!s.ok()) {
-        Debug(logger_, "Failed finishing zone");
-        return s;
-      }
-      active_io_zones_--;
-    }
+    // // 일정 수준 threshold 아래로 내려간 존은 finish 해서 full 상태로 만듬
+    // // (wp 를 zone size 로 맞추고, capacity_ == 0)
+    // if ((z->capacity_ < (z->max_capacity_ * finish_threshold_ / 100))) {
+    //   /* If there is less than finish_threshold_% remaining capacity in a
+    //    * non-open-zone, finish the zone */
+    //   s = z->Finish();
+    //   if (!s.ok()) {
+    //     Debug(logger_, "Failed finishing zone");
+    //     return s;
+    //   }
+    //   active_io_zones_--;
+    // }
 
-    if (!z->IsFull()) {
-      if (finish_victim == nullptr) {
-        finish_victim = z;
-      } else if (finish_victim->capacity_ > z->capacity_) {
-        IOStatus status = finish_victim->CheckRelease();
-        if (!status.ok()) return status;
-        finish_victim = z;
-      } else {
-        IOStatus status = z->CheckRelease();
-        if (!status.ok()) return status;
-      }
-    } else {
-      IOStatus status = z->CheckRelease();
-      if (!status.ok()) return status;
-    }
+  //   if (!z->IsFull()) {
+  //     if (finish_victim == nullptr) {
+  //       finish_victim = z;
+  //     } else if (finish_victim->capacity_ > z->capacity_) {
+  //       // finish_victim 보다 더 적은 양이 남은 zone 이 있다면, 그 zone 이
+  //       // 결국에 finish_victim 이 됨 그 전에 finish_victim 을 busy 에서
+  //       // 풀어주고..
+  //       IOStatus status = finish_victim->CheckRelease();
+  //       if (!status.ok()) return status;
+  //       finish_victim = z;
+  //     } else {
+  //       IOStatus status = z->CheckRelease();
+  //       if (!status.ok()) return status;
+  //     }
+  //   } else {
+  //     IOStatus status = z->CheckRelease();
+  //     if (!status.ok()) return status;
+  //   }
   }
 
   // Holding finish_victim if != nullptr
 
   /* Try to fill an already open zone(with the best life time diff) */
-  for (const auto z : io_zones) {
-    if (z->Acquire()) {
-      if ((z->used_capacity_ > 0) && !z->IsFull()) {
-        unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
-        if (diff <= best_diff) {
-          if (allocated_zone != nullptr) {
-            IOStatus status = allocated_zone->CheckRelease();
-            if (!status.ok()) return status;
-          }
-          allocated_zone = z;
-          best_diff = diff;
-        } else {
-          IOStatus status = z->CheckRelease();
-          if (!status.ok()) return status;
-        }
-      } else {
-        IOStatus status = z->CheckRelease();
-        if (!status.ok()) return status;
-      }
-    }
-  }
+  // for (const auto z : io_zones) {
+  //   if (z->Acquire()) {
+  //     // 이미 open 된 zone 을 재사용하기 위해
+  //     if ((z->used_capacity_ > 0) && !z->IsFull()) {
+  //       unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
+  //       if (diff <= best_diff) {
+  //         if (allocated_zone != nullptr) {
+  //           IOStatus status = allocated_zone->CheckRelease();
+  //           if (!status.ok()) return status;
+  //         }
+  //         allocated_zone = z;
+  //         best_diff = diff;
+  //       } else {
+  //         IOStatus status = z->CheckRelease();
+  //         if (!status.ok()) return status;
+  //       }
+  //     } else {
+  //       IOStatus status = z->CheckRelease();
+  //       if (!status.ok()) return status;
+  //     }
+  //   }
+  // }
 
   // Holding finish_victim if != nullptr
   // Holding allocated_zone if != nullptr
@@ -624,15 +666,15 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
   if (best_diff >= LIFETIME_DIFF_NOT_GOOD) {
     /* If we at the active io zone limit, finish an open zone(if available) with
      * least capacity left */
-    if (active_io_zones_.load() == max_nr_active_io_zones_ &&
-        finish_victim != nullptr) {
-      s = finish_victim->Finish();
-      if (!s.ok()) {
-        Debug(logger_, "Failed finishing zone");
-        return s;
-      }
-      active_io_zones_--;
-    }
+    // if (active_io_zones_.load() == max_nr_active_io_zones_ &&
+    //     finish_victim != nullptr) {
+    //   s = finish_victim->Finish();
+    //   if (!s.ok()) {
+    //     Debug(logger_, "Failed finishing zone");
+    //     return s;
+    //   }
+    //   active_io_zones_--;
+    // }
 
     if (active_io_zones_.load() < max_nr_active_io_zones_) {
       for (const auto z : io_zones) {
@@ -667,9 +709,12 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
     assert(ok);
     open_io_zones_++;
     Debug(logger_,
-          "Allocating zone(new=%d) start: 0x%lx wp: 0x%lx lt: %d file lt: %d\n",
-          new_zone, allocated_zone->start_, allocated_zone->wp_,
-          allocated_zone->lifetime_, file_lifetime);
+          "Allocating zone[%ld](new=%d) start: 0x%lx wp: 0x%lx lt: %d file lt: "
+          "%d, diff=%d\n",
+          allocated_zone->start_ / allocated_zone->max_capacity_, new_zone,
+          allocated_zone->start_, allocated_zone->wp_,
+          allocated_zone->lifetime_, file_lifetime,
+          allocated_zone->lifetime_ != file_lifetime);
   }
 
   io_zones_mtx.unlock();

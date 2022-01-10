@@ -57,6 +57,10 @@ class ZoneFile {
   time_t m_time_;
 
  public:
+  std::string getFilename() {
+    return filename_;
+  };
+
   explicit ZoneFile(ZonedBlockDevice* zbd, std::string filename,
                     uint64_t file_id_);
 

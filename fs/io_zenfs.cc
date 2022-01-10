@@ -28,6 +28,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+extern std::shared_ptr<Logger> _logger;
+
 ZoneExtent::ZoneExtent(uint64_t start, uint32_t length, Zone* zone)
     : start_(start), length_(length), zone_(zone) {}
 
@@ -202,7 +204,11 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
       filename_(filename),
       file_id_(file_id),
       nr_synced_extents_(0),
-      m_time_(0) {}
+      m_time_(0) {
+
+        Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
+
+      }
 
 std::string ZoneFile::GetFilename() { return filename_; }
 void ZoneFile::Rename(std::string name) { filename_ = name; }
@@ -218,6 +224,9 @@ ZoneFile::~ZoneFile() {
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
+    Debug(_logger, "ZoneFile::~ZoneFile(): file=%s, zone[%ld] start_=0x%lx, used_capacity_=0x%lx",
+          filename_.c_str(),
+          zone->start_ / zone->max_capacity_, zone->start_, zone->used_capacity_.load());
     delete *e;
   }
   IOStatus s = CloseWR();
@@ -368,6 +377,11 @@ void ZoneFile::PushExtent() {
   active_zone_->used_capacity_ += length;
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = fileSize;
+
+  Debug(_logger, "ZoneFile::PushExtent(): filename=%s, zone[%ld] used_capacity_=%ld",
+		  filename_.c_str(),
+		  active_zone_->start_ / active_zone_->max_capacity_,
+		  active_zone_->used_capacity_.load());
 }
 
 /* Assumes that data and size are block aligned */
@@ -419,6 +433,14 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
     wr_size = left;
     if (wr_size > active_zone_->capacity_) wr_size = active_zone_->capacity_;
 
+    Debug(_logger, "ZoneFile::Append(), zone[%ld] start=0x%lx, wp=0x%lx, cap=0x%lx, used_cap=0x%lx, wr_size=%d",
+		    active_zone_->start_ / active_zone_->max_capacity_,
+		    active_zone_->start_,
+		    active_zone_->wp_,
+		    active_zone_->capacity_,
+		    active_zone_->used_capacity_.load(),
+		    wr_size);
+
     s = active_zone_->Append((char*)data + offset, wr_size);
     if (!s.ok()) return s;
 
@@ -433,6 +455,8 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
 
 IOStatus ZoneFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime) {
   lifetime_ = lifetime;
+  Debug(_logger, "ZoneFile::SetWriteLifeTimeHint(): file=%s, lifetime=%d",
+        filename_.c_str(), lifetime_);
   return IOStatus::OK();
 }
 
@@ -528,6 +552,7 @@ IOStatus ZonedWritableFile::RangeSync(uint64_t offset, uint64_t nbytes,
 
 IOStatus ZonedWritableFile::Close(const IOOptions& options,
                                   IODebugContext* dbg) {
+  Debug(_logger, "ZonedWritableFile::Close(): Closing ...");
   Fsync(options, dbg);
   return zoneFile_->CloseWR();
 }
