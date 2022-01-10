@@ -17,6 +17,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <time.h>
+#include <chrono>
 
 #include <cstdlib>
 #include <fstream>
@@ -30,6 +32,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "snapshot.h"
+#include "logging/logging.h"
 
 #define KB (1024)
 #define MB (1024 * KB)
@@ -46,17 +49,27 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+extern std::shared_ptr<Logger> _logger;
+
 Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
     : zbd_(zbd),
       busy_(false),
       start_(zbd_zone_start(z)),
       max_capacity_(zbd_zone_capacity(z)),
-      wp_(zbd_zone_wp(z)) {
+      wp_(zbd_zone_wp(z)),
+      wp_before_finish_(wp_) {
   lifetime_ = Env::WLTH_NOT_SET;
   used_capacity_ = 0;
   capacity_ = 0;
   if (!(zbd_zone_full(z) || zbd_zone_offline(z) || zbd_zone_rdonly(z)))
     capacity_ = zbd_zone_capacity(z) - (zbd_zone_wp(z) - zbd_zone_start(z));
+
+  Debug(_logger, "Zone::Zone(): zone[%ld] start_=0x%lx, capacity_=0x%lx",
+        this->start_ / this->max_capacity_, this->start_,
+        this->capacity_);
+
+  extent_start_ = start_;
+  id_ = start_ / zbd_zone_len(z);
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -92,9 +105,7 @@ IOStatus Zone::Reset() {
   struct zbd_zone z;
   int ret;
 
-  assert(!IsUsed());
-  assert(IsBusy());
-
+  ROCKS_LOG_INFO(_logger, "reset zone %ld", GetZoneId());
   ret = zbd_reset_zones(zbd_->GetWriteFD(), start_, zone_sz);
   if (ret) return IOStatus::IOError("Zone reset failed\n");
 
@@ -109,7 +120,9 @@ IOStatus Zone::Reset() {
     max_capacity_ = capacity_ = zbd_zone_capacity(&z);
 
   wp_ = start_;
+  wp_before_finish_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
+  extent_start_ = start_;
 
   return IOStatus::OK();
 }
@@ -119,12 +132,11 @@ IOStatus Zone::Finish() {
   int fd = zbd_->GetWriteFD();
   int ret;
 
-  assert(IsBusy());
-
   ret = zbd_finish_zones(fd, start_, zone_sz);
   if (ret) return IOStatus::IOError("Zone finish failed\n");
 
   capacity_ = 0;
+  wp_before_finish_ = wp_;
   wp_ = start_ + zone_sz;
 
   return IOStatus::OK();
@@ -142,6 +154,9 @@ IOStatus Zone::Close() {
     if (ret) return IOStatus::IOError("Zone close failed\n");
   }
 
+  ROCKS_LOG_INFO(_logger, "Zone::Finish(): Close zone[%ld]",
+        this->start_ / this->max_capacity_);
+
   return IOStatus::OK();
 }
 
@@ -150,18 +165,27 @@ IOStatus Zone::Append(char *data, uint32_t size) {
   uint32_t left = size;
   int fd = zbd_->GetWriteFD();
   int ret;
+  // NOWS: Namespace Optimal Write Size
+  uint32_t unit = 128 * KB;
 
-  if (capacity_ < size)
+  if (capacity_ < size) {
+    printf("zone %ld capacity full\n", GetZoneId());
+    ROCKS_LOG_ERROR(_logger, "zone append failed. zone %ld capacity full, cap=%ld, size=%u",
+        GetZoneId(), capacity_, size);
     return IOStatus::NoSpace("Not enough capacity for append");
+  }
 
   assert((size % zbd_->GetBlockSize()) == 0);
 
   while (left) {
-    ret = pwrite(fd, ptr, size, wp_);
+    unit = (unit > left) ? left : unit;
+    ret = pwrite(fd, ptr, unit, wp_);
     if (ret < 0) return IOStatus::IOError("Write failed");
+    assert(ret == (int) unit);
 
     ptr += ret;
     wp_ += ret;
+    wp_before_finish_ += ret;
     capacity_ -= ret;
     left -= ret;
   }
@@ -190,6 +214,8 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
                                    std::shared_ptr<ZenFSMetrics> metrics)
     : filename_("/dev/" + bdevname), logger_(logger), metrics_(metrics) {
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
+
+  nr_active_zsgs_ = 0;
 }
 
 std::string ZonedBlockDevice::ErrorToString(int err) {
@@ -320,6 +346,8 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   active_io_zones_ = 0;
   open_io_zones_ = 0;
 
+  ZoneStripingGroup *zsg = nullptr;
+
   for (; i < reported_zones; i++) {
     struct zbd_zone *z = &zone_rep[i];
     /* Only use sequential write required zones */
@@ -331,7 +359,21 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
           return IOStatus::Corruption("Failed to set busy flag of zone " +
                                       std::to_string(newZone->GetZoneNr()));
         }
+
         io_zones.push_back(newZone);
+
+        // XXX: remove temporary condition for start zone
+        if (newZone->id_ >= ZSG_START_ZONE) {
+        if (!(newZone->id_ % ZSG_ZONES)) {
+            zsg = new ZoneStripingGroup(this, ZSG_ZONES,
+                newZone->id_ / ZSG_ZONES, logger_);
+            PushToZSGQ(zsg);
+            zsg->AddZone(newZone);
+        } else {
+            zsg->AddZone(newZone);
+        }
+        }
+
         if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z) ||
             zbd_zone_closed(z)) {
           active_io_zones_++;
@@ -421,14 +463,25 @@ void ZonedBlockDevice::LogZoneStats() {
 }
 
 void ZonedBlockDevice::LogZoneUsage() {
+  int cnt = 0;
+  int partial_cnt = 0;
+
   for (const auto z : io_zones) {
     int64_t used = z->used_capacity_;
 
-    if (used > 0) {
-      Debug(logger_, "Zone 0x%lX used capacity: %ld bytes (%ld MB)\n",
-            z->start_, used, used / MB);
+    if (used > 0 && !z->capacity_) {
+      Debug(logger_, "Zone[%ld] full, 0x%lX used capacity: %ld bytes (%ld MB)\n",
+            z->GetZoneId(), z->start_, used, used / MB);
+      cnt++;
+    } else if (used > 0) {
+      Debug(logger_, "Zone[%ld] partial, 0x%lX used capacity: %ld bytes (%ld MB)\n",
+            z->GetZoneId(), z->start_, used, used / MB);
+      partial_cnt++;
     }
   }
+
+  Debug(logger_, "Number of used (finished) zones: %d, partial zones: %d",
+      cnt, partial_cnt);
 }
 
 ZonedBlockDevice::~ZonedBlockDevice() {
@@ -541,7 +594,15 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
   /* Reset any unused zones and finish used zones under capacity treshold*/
   for (const auto z : io_zones) {
+    if (z->id_ >= ZSG_START_ZONE) {
+      break;
+    }
+
     if (!z->Acquire()) {
+      Debug(
+          _logger,
+          "ZonedBlockDevice::AllocateZone(): Failed to acquire. skip zone[%ld]",
+          z->start_ / z->max_capacity_);
       continue;
     }
 
@@ -553,6 +614,11 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
     if (!z->IsUsed()) {
       if (!z->IsFull()) active_io_zones_--;
+
+      Debug(_logger,
+            "ZonedBlockDevice::AllocateZone(): Not used zone. reset zone[%ld], "
+            "used_capacity_=0x%lx",
+            z->start_ / z->max_capacity_, z->used_capacity_.load());
       s = z->Reset();
       if (!s.ok()) {
         Debug(logger_, "Failed resetting zone !");
@@ -667,9 +733,12 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
     assert(ok);
     open_io_zones_++;
     Debug(logger_,
-          "Allocating zone(new=%d) start: 0x%lx wp: 0x%lx lt: %d file lt: %d\n",
-          new_zone, allocated_zone->start_, allocated_zone->wp_,
-          allocated_zone->lifetime_, file_lifetime);
+          "Allocating zone[%ld](new=%d) start: 0x%lx wp: 0x%lx lt: %d file lt: "
+          "%d, diff=%d\n",
+          allocated_zone->start_ / allocated_zone->max_capacity_, new_zone,
+          allocated_zone->start_, allocated_zone->wp_,
+          allocated_zone->lifetime_, file_lifetime,
+          allocated_zone->lifetime_ != file_lifetime);
   }
 
   io_zones_mtx.unlock();
@@ -726,6 +795,119 @@ void ZonedBlockDevice::SetZoneDeferredStatus(IOStatus status) {
 
 void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto &zone : io_zones) snapshot.emplace_back(*zone);
+}
+
+ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
+  ZoneStripingGroup *zsg;
+
+  zsgq_pop_mtx_.lock();
+  if (!zsgq_.empty()) {
+    zsg = zsgq_.front();
+    zsgq_.pop();
+    nr_active_zsgs_++;
+  } else {
+    return nullptr;
+  }
+  zsgq_pop_mtx_.unlock();
+
+  zsg->current_sst_files_++;
+  zsg->total_sst_files_++;
+  ROCKS_LOG_INFO(_logger, "zsg %d, first zone %ld, total_sst_files_=%d",
+      zsg->id_, zsg->zones_[0]->GetZoneId(), zsg->total_sst_files_);
+
+  return zsg;
+}
+
+static void BGWorkAppend(char *data, size_t size, Zone *zone,
+                         IODebugContext* /*dbg*/);
+
+void ZoneStripingGroup::Append(void *data, size_t size, IODebugContext *dbg) {
+  const size_t block_size = zbd_->GetBlockSize();
+  char *_data = (char *) data;
+  size_t left = size;
+
+  if (dbg) {
+    buffers_.push_back(dbg);
+  }
+
+  while (left) {
+    assert(current_zone_ < ZSG_ZONES);
+    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
+    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
+
+    thread_pool_.push_back(std::thread(BGWorkAppend, _data,
+                                        aligned, zones_[current_zone_++],
+                                        dbg));
+
+    _data += aligned;
+    left = (left < aligned) ? 0 : left - aligned;
+  }
+}
+
+static void BGWorkAppend(char *data, size_t size, Zone *zone,
+                         IODebugContext* /*dbg*/) {
+  IOStatus s;
+
+  s = zone->Append(data, size);
+  if (!s.ok()) {
+    ROCKS_LOG_ERROR(_logger, " zone %ld append pwrite failed, nr_active_zsgs=%d",
+        zone->GetZoneId(), zone->zbd_->nr_active_zsgs_.load());
+  }
+  zone->Finish();
+}
+
+void ZoneStripingGroup::Fsync(ZoneFile *zonefile) {
+  if (GetState() == ZSGState::kFull) {
+    return;
+  }
+
+  for (auto& thread : thread_pool_) {
+    thread.join();
+  }
+  thread_pool_.clear();
+
+  for (auto& dbg : buffers_) {
+    // Here, we must refit the buffer after all data written.  This should have
+    // been done from writable_file_writer.cc right after the PositionedAppend
+    // request.  We commented out that part and do it here.
+    dbg->buf_->RefitTail(dbg->file_advance_, dbg->leftover_tail_);
+    delete dbg->buf_->Release();
+  }
+  buffers_.clear();
+
+  PushExtents(zonefile);
+
+  zbd_->nr_active_zsgs_--;
+
+  SetState(ZSGState::kFull);
+}
+
+void ZoneStripingGroup::PushExtents(ZoneFile *zonefile) {
+  // Assume that we have finished writing data to zones
+  for (int i = 0; i < nr_zones_; i++) {
+    Zone *zone = zones_[i];
+    size_t length = zone->wp_before_finish_ - zone->extent_start_;
+
+    if (!length) {
+      ROCKS_LOG_WARN(_logger, "length is zero, zone %ld: start=0x%lx, wp=0x%lx, extent_start=0x%lx",
+          zone->GetZoneId(), zone->start_, zone->wp_, zone->extent_start_);
+      continue;
+    }
+
+    ROCKS_LOG_INFO(_logger,
+        "%s: zsg %d, push extent, zone %ld, start=0x%lx, length=0x%lx",
+        zonefile->GetFilename().c_str(), id_,
+        zone->GetZoneId(), zone->extent_start_, length);
+    zonefile->PushExtent(new ZoneExtent(zone->extent_start_, length, zone));
+    zone->used_capacity_ += length;
+    zone->extent_start_ = zone->wp_before_finish_;
+  }
+
+  if (zonefile->GetExtents().size() != (size_t) nr_zones_) {
+    ROCKS_LOG_WARN(_logger, "%s nr_extents=%d, nr_zones=%d mismatch",
+        zonefile->GetFilename().c_str(), (int) zonefile->GetExtents().size(),
+        nr_zones_);
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE
