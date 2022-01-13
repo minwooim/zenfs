@@ -70,6 +70,14 @@ class ZoneFile {
   IOStatus CloseWR();
   bool IsOpenForWR();
 
+  void Append(void *data, int data_size);
+
+  ZoneStripingGroup *zsg_;
+  int id_in_zsg_;
+  inline bool InZSG() {
+    return !!zsg_;
+  }
+
   IOStatus Append(void* data, int data_size, int valid_size);
   IOStatus SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime);
   std::string GetFilename();
@@ -88,6 +96,9 @@ class ZoneFile {
                           char* scratch, bool direct);
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
   void PushExtent();
+  inline void PushExtent(ZoneExtent *extent) {
+    extents_.push_back(extent);
+  }
 
   void EncodeTo(std::string* output, uint32_t extent_start);
   void EncodeUpdateTo(std::string* output) {
@@ -102,6 +113,8 @@ class ZoneFile {
 
   uint64_t GetID() { return file_id_; }
   size_t GetUniqueId(char* id, size_t max_size);
+
+  void Fsync();
 
  private:
   void ReleaseActiveZone();

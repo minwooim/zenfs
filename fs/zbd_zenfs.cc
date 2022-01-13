@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <time.h>
 
 #include <cstdlib>
 #include <fstream>
@@ -63,6 +64,8 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
   Debug(_logger, "Zone::Zone(): zone[%ld] start_=0x%lx, used_capacity_=0x%lx",
         this->start_ / this->max_capacity_, this->start_,
         this->used_capacity_.load());
+
+  extent_start_ = start_;
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -335,7 +338,10 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   active_io_zones_ = 0;
   open_io_zones_ = 0;
 
-  for (; i < reported_zones; i++) {
+  zsgs_.resize(reported_zones);
+  ZoneStripingGroup *zsg = nullptr;
+
+  for (int j = 0; i < reported_zones; i++,j++) {
     struct zbd_zone *z = &zone_rep[i];
     /* Only use sequential write required zones */
     if (zbd_zone_type(z) == ZBD_ZONE_TYPE_SWR) {
@@ -346,7 +352,22 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
           return IOStatus::Corruption("Failed to set busy flag of zone " +
                                       std::to_string(newZone->GetZoneNr()));
         }
+
         io_zones.push_back(newZone);
+
+        // XXX: remove temporary condition for start zone
+        if (j >= 40000) {
+        if (!(j & (ZSG_ZONES - 1))) {
+            int id = j / ZSG_ZONES;
+            zsg = new ZoneStripingGroup(this, ZSG_ZONES, id, logger_);
+            zsgs_[id] = zsg;
+            zsgq_.push(zsg);
+            zsg->AddZone(newZone);
+        } else {
+            zsg->AddZone(newZone);
+        }
+        }
+
         if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z) ||
             zbd_zone_closed(z)) {
           active_io_zones_++;
@@ -771,6 +792,109 @@ void ZonedBlockDevice::SetZoneDeferredStatus(IOStatus status) {
 
 void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto &zone : io_zones) snapshot.emplace_back(*zone);
+}
+
+ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup(int *id) {
+  ZoneStripingGroup *zsg;
+
+  if (!zsgpq_.empty()) {
+    zsg = zsgpq_.front();
+    zsgpq_.pop();
+  } else if (!zsgq_.empty()) {
+    zsg = zsgq_.front();
+    zsgq_.pop();
+  } else {
+    return nullptr;
+  }
+
+  assert(zsg->GetState() == ZSGState::kEmpty ||
+          zsg->GetState() == ZSGState::kPartialIdle);
+
+  zsg->SetState(ZSGState::kPartialInprogress);
+
+  Info(logger_, "[ZSG #%ld] allocated zsg", zsg->GetId());
+  for (int i = 0; i < zsg->GetNumZones(); i++) {
+      Info(logger_, "[ZSG #%ld]     zone[%ld]",
+              zsg->GetId(), zsg->GetZone(i)->GetZoneId());
+  }
+
+  *id = zsg->current_sst_files_++;
+
+  return zsg;
+}
+
+void ZoneStripingGroup::Append(int id, void *data, size_t size) {
+  if (!buffers_[id].Capacity()) {
+    buffers_[id].AllocateNewBuffer(96 * 1024 * 1024);
+  }
+
+  Info(logger_, "[ZSG #%d]     buffer append (id=%d, size=0x%lx, current=0x%lx)",
+      id_, id, size, buffers_[id].CurrentSize());
+  // First, just buffering the data from the upper layer
+  buffers_[id].Append((char *) data, size);
+}
+
+static void BGWorkAppend(char *data, size_t size, Zone *zone) {
+  zone->Append(data, size);
+}
+
+void ZoneStripingGroup::Fsync(int id) {
+  size_t size = buffers_[id].CurrentSize();
+  size_t left = size;
+  const size_t each = left / nr_zones_;
+  char *data = buffers_[id].BufferStart();
+  const uint32_t block_size = zbd_->GetBlockSize();
+
+  Info(logger_, "[ZSG #%d] buffer fsync (id=%d, size=0x%lx)", id_, id, size);
+
+  if (!size) {
+    return;
+  }
+
+  // Write out the data to the device
+  for (int i = 0; i < nr_zones_; i++) {
+    size_t per_size = (left > each) ? each: left;
+    size_t aligned = (per_size + (block_size - 1)) & ~(block_size - 1);
+
+    Info(logger_, "[ZSG #%d]     zone[%ld] append (size=0x%lx)",
+        id_, zones_[i]->GetZoneId(), aligned);
+    thread_pool_.push_back(std::thread(BGWorkAppend, data, aligned, zones_[i]));
+
+    left -= aligned;
+    data += aligned;
+  }
+
+  for (auto& thread : thread_pool_) {
+    thread.join();
+  }
+  thread_pool_.clear();
+  buffers_[id].Release();
+
+  state_ = ZSGState::kPartialIdle;
+
+  if (!IsFull()) {
+    Info(logger_, "[ZSG #%d] push to partial queue", id_);
+    zbd_->PushToZSGPartialQueue(this);
+  }
+}
+
+void ZoneStripingGroup::PushExtents(ZoneFile *zonefile) {
+  // Assume that we have finished writing data to zones
+  for (int i = 0; i < nr_zones_; i++) {
+    Zone *zone = zones_[i];
+    size_t length = zone->wp_ - zone->extent_start_;
+
+    if (!length) {
+      continue;
+    }
+
+    Info(logger_, "[ZSG #%d]     push extent to zone[%ld] (zone->start_=0x%lx, extent_start=0x%lx, length=%ld)",
+        id_, zone->GetZoneId(), zone->start_, zone->extent_start_, length);
+
+    zonefile->PushExtent(new ZoneExtent(zone->extent_start_, length, zone));
+    zone->used_capacity_ += length;
+    zone->extent_start_ = zone->wp_;
+  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

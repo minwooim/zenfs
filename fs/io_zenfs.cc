@@ -206,6 +206,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
       nr_synced_extents_(0),
       m_time_(0) {
 
+        zsg_ = nullptr;
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
 
       }
@@ -384,6 +385,17 @@ void ZoneFile::PushExtent() {
 		  active_zone_->used_capacity_.load());
 }
 
+void ZoneFile::Append(void *data, int data_size) {
+  if (!zsg_) {
+    int id;
+    zsg_ = zbd_->AllocateZoneStripingGroup(&id);
+    id_in_zsg_ = id;
+  }
+
+  zsg_->Append(id_in_zsg_, data, data_size);
+  fileSize += data_size;
+}
+
 /* Assumes that data and size are block aligned */
 IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
   uint32_t left = data_size;
@@ -521,6 +533,15 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
                                   IODebugContext* /*dbg*/) {
   IOStatus s;
 
+  Debug(_logger, "ZonedWritableFile::Fsync(): file=%s",
+		  zoneFile_->getFilename().c_str());
+
+  // Finish (actual write to zones) zone group
+  // We need to keep going for the last footer metdata blocks.
+  if (zoneFile_->InZSG()) {
+    zoneFile_->Fsync();
+  }
+
   buffer_mtx_.lock();
   s = FlushBuffer();
   buffer_mtx_.unlock();
@@ -534,6 +555,8 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
 
 IOStatus ZonedWritableFile::Sync(const IOOptions& options,
                                  IODebugContext* dbg) {
+  Debug(_logger, "ZonedWritableFile::Sync(): file=%s",
+		  zoneFile_->getFilename().c_str());
   return Fsync(options, dbg);
 }
 
@@ -561,6 +584,8 @@ IOStatus ZonedWritableFile::FlushBuffer() {
   uint32_t align, pad_sz = 0, wr_sz;
   IOStatus s;
 
+  Debug(_logger, "ZonedWritableFile::FlushBuffer(): file=%s",
+		  zoneFile_->getFilename().c_str());
   if (!buffer_pos) return IOStatus::OK();
 
   align = buffer_pos % block_sz;
@@ -656,26 +681,13 @@ IOStatus ZonedWritableFile::Append(const Slice& data,
   return s;
 }
 
-IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t offset,
+IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t /*offset*/,
                                              const IOOptions& /*options*/,
                                              IODebugContext* /*dbg*/) {
-  IOStatus s;
-
-  if (offset != wp) {
-    assert(false);
-    return IOStatus::IOError("positioned append not at write pointer");
-  }
-
-  if (buffered) {
-    buffer_mtx_.lock();
-    s = BufferedWrite(data);
-    buffer_mtx_.unlock();
-  } else {
-    s = zoneFile_->Append((void*)data.data(), data.size(), data.size());
-    if (s.ok()) wp += data.size();
-  }
-
-  return s;
+  // We can say that this case is only for sst files.
+  zoneFile_->Append((void *) data.data(), data.size());
+  wp += data.size();
+  return IOStatus::OK();
 }
 
 void ZonedWritableFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint hint) {
@@ -739,6 +751,11 @@ size_t ZoneFile::GetUniqueId(char* id, size_t max_size) {
 
 size_t ZonedRandomAccessFile::GetUniqueId(char* id, size_t max_size) const {
   return zoneFile_->GetUniqueId(id, max_size);
+}
+
+void ZoneFile::Fsync() {
+  zsg_->Fsync(id_in_zsg_);
+  zsg_->PushExtents(this);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

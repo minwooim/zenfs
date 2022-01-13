@@ -20,15 +20,23 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <queue>
 
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "port/port_posix.h"
+#include "util/aligned_buffer.h"
+
+// It must be power of 2
+#define ZSG_ZONES 2
 
 namespace ROCKSDB_NAMESPACE {
 
 class ZonedBlockDevice;
 class ZoneSnapshot;
+class ZoneFile;
+class ZoneStripingGroup;
 
 class Zone {
   ZonedBlockDevice *zbd_;
@@ -43,6 +51,11 @@ class Zone {
   uint64_t wp_;
   Env::WriteLifeTimeHint lifetime_;
   std::atomic<long> used_capacity_;
+
+  // This is only for ZSG.
+  // We can have this here in Zone because a single zone can have exactly
+  // N SST files.
+  uint64_t extent_start_;
 
   IOStatus Reset();
   IOStatus Finish();
@@ -71,6 +84,131 @@ class Zone {
   IOStatus CloseWR(); /* Done writing */
 
   inline IOStatus CheckRelease();
+
+  inline uint64_t GetZoneId() {
+    return start_ / max_capacity_;
+  }
+
+  inline uint64_t GetStartLBA() {
+    // XXX: Should get LBA size of this block device
+    return start_ / 4096;
+  }
+
+  inline uint64_t GetWritePointer() {
+    return wp_;
+  }
+};
+
+enum class ZSGState {
+  kEmpty              = 0,
+  kPartialInprogress  = 1,
+  kPartialIdle        = 2,
+  kFull               = 3,
+};
+
+class ZoneStripingGroup {
+ private:
+  ZonedBlockDevice *zbd_;
+  ZSGState state_;
+  int nr_zones_;
+  int id_;
+  int current_nr_zones_;
+  std::vector<Zone *> zones_;
+  std::shared_ptr<Logger> logger_;
+
+  std::vector<std::thread> thread_pool_;
+
+  // Number of current SST files written
+
+  std::vector<AlignedBuffer> buffers_;
+
+ public:
+  int current_sst_files_;
+
+  ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
+      std::shared_ptr<Logger> logger) {
+    zbd_ = zbd;
+    state_ = ZSGState::kEmpty;
+    nr_zones_ = nr_zones;
+    id_ = id;
+    current_nr_zones_ = 0;
+    zones_.resize(nr_zones);
+    logger_ = logger;
+
+    thread_pool_.reserve(nr_zones);
+
+    current_sst_files_ = 0;
+
+    // nr_zones == number of files in a zone
+    buffers_.resize(nr_zones);
+    for (int i = 0; i < nr_zones; i++) {
+      buffers_[i].Alignment(4096);
+    }
+  }
+
+  ~ZoneStripingGroup();
+
+  uint64_t GetId() {
+    return id_;
+  }
+
+  int GetNumZones() {
+    return nr_zones_;
+  }
+
+  Zone *GetZone(int id) {
+    return zones_[id];
+  }
+
+  void AddZone(Zone *zone) {
+    zones_[current_nr_zones_++] = zone;
+    Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
+        id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
+  }
+
+  bool IsFull() {
+    return nr_zones_ == current_sst_files_;
+  }
+
+  ZSGState GetState() {
+    return state_;
+  }
+
+  void SetState(ZSGState state) {
+    switch (state_) {
+      case ZSGState::kEmpty:
+        if (state == ZSGState::kPartialInprogress) {
+          break;
+        }
+        [[fallthrough]];
+      case ZSGState::kPartialInprogress:
+        if (state == ZSGState::kPartialIdle ||
+            state == ZSGState::kFull) {
+          break;
+        }
+        [[fallthrough]];
+      case ZSGState::kPartialIdle:
+        if (state == ZSGState::kPartialInprogress) {
+          break;
+        }
+        [[fallthrough]];
+      case ZSGState::kFull:
+        if (state == ZSGState::kEmpty) {
+          break;
+        }
+        [[fallthrough]];
+      default:
+        assert(false);
+        return;
+    }
+
+    state_ = state;
+  }
+
+  // IOStatus BGWorkAppend(int i, char *data, size_t size);
+  void Append(int id, void *data, size_t size);
+  void Fsync(int id);
+  void PushExtents(ZoneFile *zonefile);
 };
 
 class ZonedBlockDevice {
@@ -79,6 +217,9 @@ class ZonedBlockDevice {
   uint32_t block_sz_;
   uint64_t zone_sz_;
   uint32_t nr_zones_;
+  std::vector<ZoneStripingGroup *> zsgs_;
+  std::queue<ZoneStripingGroup *> zsgq_;
+  std::queue<ZoneStripingGroup *> zsgpq_; // partial queue
   std::vector<Zone *> io_zones;
   std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
@@ -152,6 +293,11 @@ class ZonedBlockDevice {
   std::shared_ptr<ZenFSMetrics> GetMetrics() { return metrics_; }
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
+
+  ZoneStripingGroup *AllocateZoneStripingGroup(int *id);
+  inline void PushToZSGPartialQueue(ZoneStripingGroup *zsg) {
+    zsgpq_.push(zsg);
+  }
 
  private:
   std::string ErrorToString(int err);
