@@ -131,8 +131,6 @@ IOStatus Zone::Finish() {
   int fd = zbd_->GetWriteFD();
   int ret;
 
-  assert(IsBusy());
-
   ret = zbd_finish_zones(fd, start_, zone_sz);
   if (ret) return IOStatus::IOError("Zone finish failed\n");
 
@@ -838,7 +836,7 @@ static void BGWorkAppend(char *data, size_t size, Zone *zone) {
   zone->Append(data, size);
 }
 
-void ZoneStripingGroup::Fsync(int id) {
+void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int id) {
   size_t size = buffers_[id].CurrentSize();
   size_t left = size;
   const size_t each = left / nr_zones_;
@@ -872,9 +870,15 @@ void ZoneStripingGroup::Fsync(int id) {
 
   state_ = ZSGState::kPartialIdle;
 
+  PushExtents(zonefile);
+
   if (!IsFull()) {
     Info(logger_, "[ZSG #%d] push to partial queue", id_);
     zbd_->PushToZSGPartialQueue(this);
+  } else {
+    for (int i = 0; i < nr_zones_; i++) {
+      zones_[i]->Finish();
+    }
   }
 }
 

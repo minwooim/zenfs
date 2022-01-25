@@ -25,6 +25,7 @@
 
 #include "rocksdb/env.h"
 #include "util/coding.h"
+#include "logging/logging.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -754,8 +755,9 @@ size_t ZonedRandomAccessFile::GetUniqueId(char* id, size_t max_size) const {
 }
 
 void ZoneFile::Fsync() {
-  zsg_->Fsync(id_in_zsg_);
-  zsg_->PushExtents(this);
+  zsg_->Fsync(this, id_in_zsg_);
+
+  ROCKS_LOG_INFO(_logger, "file %s (size=%ld)", filename_.c_str(), fileSize);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

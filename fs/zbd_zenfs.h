@@ -207,7 +207,7 @@ class ZoneStripingGroup {
 
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
   void Append(int id, void *data, size_t size);
-  void Fsync(int id);
+  void Fsync(ZoneFile *zonefile, int id);
   void PushExtents(ZoneFile *zonefile);
 };
 
