@@ -27,6 +27,7 @@
 #include "rocksdb/io_status.h"
 #include "port/port_posix.h"
 #include "util/aligned_buffer.h"
+#include "logging/logging.h"
 
 // It must be power of 2
 #define ZSG_ZONES 2
@@ -97,6 +98,8 @@ class Zone {
   inline uint64_t GetWritePointer() {
     return wp_;
   }
+
+  int nr_invalid_extents_;
 };
 
 enum class ZSGState {
@@ -121,6 +124,11 @@ class ZoneStripingGroup {
   // Number of current SST files written
 
   std::vector<AlignedBuffer> buffers_;
+  // Number of invalid SST files in this group.  If equals to nr_zones_, then
+  // zones in this group can be reset without any consideration.  If less than
+  // nr_zones_, it means this gruop has internal fragmentation which the space
+  // utilization can decrease.
+  int invalid_ssts_;
 
  public:
   int current_sst_files_;
@@ -144,6 +152,8 @@ class ZoneStripingGroup {
     for (int i = 0; i < nr_zones; i++) {
       buffers_[i].Alignment(4096);
     }
+
+    invalid_ssts_ = 0;
   }
 
   ~ZoneStripingGroup();
@@ -203,6 +213,27 @@ class ZoneStripingGroup {
     }
 
     state_ = state;
+  }
+
+  void ResetZones() {
+    for (int i = 0; i< nr_zones_; i++) {
+      Zone *zone = zones_[i];
+
+      zone->Reset();
+      ROCKS_LOG_INFO(logger_, "Reset zone (zsg_id=%d, zone_id=%ld)",
+          id_, zone->GetZoneId());
+    }
+  }
+
+  inline void InvalidateSST() {
+    invalid_ssts_++;
+    assert(invalid_ssts_ <= nr_zones_);
+
+    ROCKS_LOG_INFO(logger_, "Invalidate SST (zsg_id=%d, invalid_ssts=%d, state=%s)",
+        id_, invalid_ssts_,
+        (invalid_ssts_ == nr_zones_) ? "FULL" : "PARTIAL");
+
+    ResetZones();
   }
 
   // IOStatus BGWorkAppend(int i, char *data, size_t size);

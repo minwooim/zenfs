@@ -66,6 +66,7 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
         this->used_capacity_.load());
 
   extent_start_ = start_;
+  nr_invalid_extents_ = 0;
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -100,9 +101,6 @@ IOStatus Zone::Reset() {
   unsigned int report = 1;
   struct zbd_zone z;
   int ret;
-
-  assert(!IsUsed());
-  assert(IsBusy());
 
   ret = zbd_reset_zones(zbd_->GetWriteFD(), start_, zone_sz);
   if (ret) return IOStatus::IOError("Zone reset failed\n");
@@ -354,7 +352,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
         io_zones.push_back(newZone);
 
         // XXX: remove temporary condition for start zone
-        if (j >= 40000) {
+        if (j >= 100) {
         if (!(j & (ZSG_ZONES - 1))) {
             int id = j / ZSG_ZONES;
             zsg = new ZoneStripingGroup(this, ZSG_ZONES, id, logger_);
@@ -833,7 +831,12 @@ void ZoneStripingGroup::Append(int id, void *data, size_t size) {
 }
 
 static void BGWorkAppend(char *data, size_t size, Zone *zone) {
-  zone->Append(data, size);
+  IOStatus s;
+
+  s = zone->Append(data, size);
+  if (!s.ok()) {
+    printf("pwrite() failed\n");
+  }
 }
 
 void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int id) {

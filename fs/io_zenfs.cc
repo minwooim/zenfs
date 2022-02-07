@@ -221,6 +221,10 @@ void ZoneFile::SetFileSize(uint64_t sz) { fileSize = sz; }
 void ZoneFile::SetFileModificationTime(time_t mt) { m_time_ = mt; }
 
 ZoneFile::~ZoneFile() {
+  if (zsg_) {
+    zsg_->InvalidateSST();
+  }
+
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
     Zone* zone = (*e)->zone_;
 
