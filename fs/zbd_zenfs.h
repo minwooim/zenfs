@@ -29,15 +29,15 @@
 #include "util/aligned_buffer.h"
 
 // Number of zones being striped for a SSTable
-#define ZSG_ZONES         (4)  // --write_buffer_size / --target_file_size_base
+#define ZSG_ZONES         (32)  // --write_buffer_size / --target_file_size_base
 // Number of SSTables in a single zone.
 #define ZSG_FILES         (1)  // 1 or ZSG_ZONES
 // Size of a buffer for a zone striping group
-#define ZSG_ZONE_SIZE     (96 * 1024 * 1024)
+#define ZSG_ZONE_SIZE     (96ULL * 1024ULL * 1024ULL)
 #define ZSG_PER_ZONE_BUFFER   (ZSG_ZONE_SIZE / ZSG_FILES)
 // Actual size of a SSTable
 #define ZSG_BUFFER_SIZE   ((size_t) ZSG_PER_ZONE_BUFFER * (size_t) ZSG_ZONES)
-#define ZSG_ZONE_LIMIT    (256)
+#define ZSG_ZONE_LIMIT    (350)
 #define ZSG_MAX_OPEN_GROUP (ZSG_ZONE_LIMIT / ZSG_ZONES)
 
 #define ZSG_START_ZONE    (1024)
