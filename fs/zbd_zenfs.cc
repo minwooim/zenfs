@@ -876,7 +876,6 @@ void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int id) {
 
   size_t size = buffers_[id]->CurrentSize();
   size_t left = size;
-  const size_t each = left / nr_zones_;
   char *data = buffers_[id]->BufferStart();
   const uint32_t block_size = zbd_->GetBlockSize();
 
@@ -888,8 +887,9 @@ void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int id) {
 
   // Write out the data to the device
   for (int i = 0; i < nr_zones_; i++) {
-    size_t per_size = (left > each) ? each: left;
-    size_t aligned = (per_size + (block_size - 1)) & ~(block_size - 1);
+    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
+    // Padding last chunk to make it aligned with block size
+    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
 
     thread_pool_.push_back(std::thread(BGWorkAppend, data, aligned, zones_[i]));
     assert(thread_pool_.back().joinable());
