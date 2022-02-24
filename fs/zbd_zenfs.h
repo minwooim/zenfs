@@ -28,6 +28,8 @@
 #include "port/port_posix.h"
 #include "util/aligned_buffer.h"
 
+// Number of concurrent writers for a single SST file
+#define ZSG_WRITERS       (32)
 // Number of zones being striped for a SSTable
 #define ZSG_ZONES         (32)  // --write_buffer_size / --target_file_size_base
 // Number of SSTables in a single zone.

@@ -886,24 +886,27 @@ void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int id) {
   ROCKS_LOG_INFO(_logger, "[ZSG #%d] buffer fsync (id=%d, size=0x%lx)", id_, id, size);
 
   // Write out the data to the device
-  for (int i = 0; i < nr_zones_; i++) {
-    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
-    // Padding last chunk to make it aligned with block size
-    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
+  for (int w = 0, z = 0; w < ZSG_ZONES / ZSG_WRITERS; w++) {
+    for (int i = 0; i < ZSG_WRITERS; i++) {
+      size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
+      // Padding last chunk to make it aligned with block size
+      size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
 
-    thread_pool_.push_back(std::thread(BGWorkAppend, data, aligned, zones_[i]));
-    assert(thread_pool_.back().joinable());
+      thread_pool_.push_back(std::thread(BGWorkAppend, data, aligned, zones_[z++]));
+      assert(thread_pool_.back().joinable());
 
-    left -= aligned;
-    data += aligned;
-  }
-
-  for (auto& thread : thread_pool_) {
-    if (thread.joinable()) {
-      thread.join();
+      left -= aligned;
+      data += aligned;
     }
+
+    for (auto& thread : thread_pool_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+    thread_pool_.clear();
   }
-  thread_pool_.clear();
+
   delete buffers_[id]->Release();
   buffers_[id] = nullptr;
 
