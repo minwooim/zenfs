@@ -70,7 +70,7 @@ class ZoneFile {
   IOStatus CloseWR();
   bool IsOpenForWR();
 
-  void Append(void *data, int data_size);
+  void Append(void *data, int data_size, IODebugContext* dbg);
 
   ZoneStripingGroup *zsg_;
   int id_in_zsg_;

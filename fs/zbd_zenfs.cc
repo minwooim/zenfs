@@ -18,6 +18,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <time.h>
+#include <chrono>
 
 #include <cstdlib>
 #include <fstream>
@@ -852,7 +853,8 @@ int ZoneStripingGroup::CheckReadyZones(size_t filled) {
   return -1;
 }
 
-static void BGWorkAppend(char *data, size_t size, Zone *zone);
+static void BGWorkAppend(char *data, size_t size, Zone *zone,
+                         IODebugContext* /*dbg*/);
 
 // XXX: This can be integrated into a single method with Fsync().
 void ZoneStripingGroup::WriteSubGroup(int sub_group, AlignedBuffer *buf) {
@@ -865,44 +867,40 @@ void ZoneStripingGroup::WriteSubGroup(int sub_group, AlignedBuffer *buf) {
     ROCKS_LOG_INFO(_logger, "zsg %d, sub_group %d, thread %d creating.., zoneid=%d",
         id_, sub_group, i, s);
     sub_group_threads_.push_back(std::thread(BGWorkAppend, data, ZSG_ZONE_SIZE,
-                                              zones_[s++]));
+                                              zones_[s++], nullptr));
 
     left -= ZSG_ZONE_SIZE;
     data += ZSG_ZONE_SIZE;
   }
 }
 
-void ZoneStripingGroup::Append(int id, void *data, size_t size) {
-  int sub_group;
+void ZoneStripingGroup::Append(int /*id*/, void *data, size_t size,
+                               IODebugContext *dbg) {
+  const size_t block_size = zbd_->GetBlockSize();
+  char *_data = (char *) data;
+  size_t left = size;
+  int w = 0;
 
-  if (!buffers_[id]) {
-    buffers_[id] = new AlignedBuffer;
-    buffers_[id]->Alignment(4096);
-    buffers_[id]->AllocateNewBuffer(ZSG_BUFFER_SIZE);
+  if (dbg) {
+    buffers_.push_back(dbg);
   }
 
-  // First, just buffering the data from the upper layer
-  buffers_[id]->Append((char *) data, size);
+  while (left && w++ < ZSG_WRITERS) {
+    assert(current_zone_ < ZSG_ZONES);
+    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
+    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
 
-  // If some of zones are already filled up, then we can start over the writers
-  // right away here.  We can choose when to start here by ZSG_WRITERS.  If
-  // ZSG_WRITERS zones are filled up, then we can start the concurrent writes.
-  while ((sub_group = CheckReadyZones(buffers_[id]->CurrentSize())) != -1) {
-    // In this Append, we don't have to consider pre-busy state which cannot
-    // happen because Fsync is too far from this stage where the sub groups can
-    // be grabbed from other places.
-    assert(!IsSubGroupBusy(sub_group));
-    ROCKS_LOG_INFO(_logger, "zsg %d, sub_group %d ready (buffer->CurrentSize=%ld)",
-        id_, sub_group, buffers_[id]->CurrentSize());
-    if (!GetSubGroup(sub_group)) {
-      printf("Failed to get sub group %d in zsg %d\n", sub_group, id_);
-      abort();
-    }
-    WriteSubGroup(sub_group, buffers_[id]);
+    thread_pool_.push_back(std::thread(BGWorkAppend, _data,
+                                        aligned, zones_[current_zone_++],
+                                        dbg));
+
+    _data += aligned;
+    left = (left < aligned) ? 0 : left - aligned;
   }
 }
 
-static void BGWorkAppend(char *data, size_t size, Zone *zone) {
+static void BGWorkAppend(char *data, size_t size, Zone *zone,
+                         IODebugContext* /*dbg*/) {
   IOStatus s;
 
   s = zone->Append(data, size);
@@ -919,65 +917,28 @@ void ZonedBlockDevice::PushToZSGPartialQueue(ZoneStripingGroup *zsg) {
   zsgpq_push_mtx_.unlock();
 }
 
-void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int id) {
-  if (!buffers_[id]) {
+void ZoneStripingGroup::Fsync(ZoneFile *zonefile, int /*id*/) {
+  if (GetState() == ZSGState::kFull) {
     return;
   }
 
-  size_t size = buffers_[id]->CurrentSize();
-  size_t left = size;
-  const uint32_t block_size = zbd_->GetBlockSize();
-
-  if (!size) {
-    return;
-  }
-
-  ROCKS_LOG_INFO(_logger, "[ZSG #%d] buffer fsync (id=%d, size=0x%lx)", id_, id, size);
-
-  // Write out the data to the device
-  for (int w = 0, z = 0; w < ZSG_SUB_GROUP; w++, z = w * ZSG_WRITERS) {
-    if (!GetSubGroup(w)) {
-      // Pre-written or in-progress written data
-      left -= ZSG_ZONE_SIZE;
-      ROCKS_LOG_INFO(_logger, "zsg %d, skip sub group %d fsync", id_, w);
-      continue;
-    }
-
-    char *data = buffers_[id]->BufferStart() + GetSubGroupOffset(w);
-
-    for (int i = 0; i < ZSG_WRITERS && left > 0; i++) {
-      size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
-      // Padding last chunk to make it aligned with block size
-      size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
-
-      thread_pool_.push_back(std::thread(BGWorkAppend, data, aligned, zones_[z++]));
-      assert(thread_pool_.back().joinable());
-
-      if (left < aligned) {
-        left = 0;
-      } else {
-        left -= aligned;
-      }
-      data += aligned;
-    }
-
-    for (auto& thread : thread_pool_) {
-      if (thread.joinable()) {
-        thread.join();
-      }
-    }
-    thread_pool_.clear();
-  }
-
-  for (auto& thread : sub_group_threads_) {
+  for (auto& thread : thread_pool_) {
     thread.join();
   }
-  sub_group_threads_.clear();
-
-  delete buffers_[id]->Release();
-  buffers_[id] = nullptr;
-
   SetState(ZSGState::kPartialIdle);
+  thread_pool_.clear();
+
+  for (auto& dbg : buffers_) {
+    // Here, we must refit the buffer after all data written.  This should have
+    // been done from writable_file_writer.cc right after the PositionedAppend
+    // request.  We commented out that part and do it here.
+    dbg->buf_->RefitTail(dbg->file_advance_, dbg->leftover_tail_);
+
+    ROCKS_LOG_INFO(_logger, "%s: rel buffer: %p",
+        zonefile->GetFilename().c_str(), dbg->buf_->BufferStart());
+    delete dbg->buf_->Release();
+  }
+  buffers_.clear();
 
   PushExtents(zonefile);
 

@@ -25,11 +25,12 @@
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/file_system.h"
 #include "port/port_posix.h"
 #include "util/aligned_buffer.h"
 
 // Number of concurrent writers for a single SST file
-#define ZSG_WRITERS       (32)
+#define ZSG_WRITERS       (4)
 // Number of zones being striped for a SSTable
 #define ZSG_ZONES         (32)  // --write_buffer_size / --target_file_size_base
 
@@ -138,8 +139,6 @@ class ZoneStripingGroup {
 
   // Number of current SST files written
 
-  std::vector<AlignedBuffer *> buffers_;
-
   // Two cases where this variable is updated:
   //   (1) ZonedBlockDevice::AllocateZoneStripingGroup
   //   (2) ZoneFile::~ZoneFile()
@@ -153,6 +152,11 @@ class ZoneStripingGroup {
   int current_sub_group_;
   std::vector<std::thread> sub_group_threads_;
   size_t sub_group_written_;
+
+  int current_zone_;
+  std::atomic<int> current_writers_;
+
+  std::vector<IODebugContext *> buffers_;
 
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
@@ -169,15 +173,15 @@ class ZoneStripingGroup {
     current_sst_files_ = 0;
     total_sst_files_ = 0;
 
-    // nr_zones == number of files in a zone
-    buffers_.resize(nr_zones);
-
     for (auto& x : sub_group_busy_) {
       std::atomic_init(&x, false);
     }
     current_sub_group_ = 0;
     sub_group_threads_.reserve(ZSG_SUB_GROUP);
     sub_group_written_ = 0;
+
+    current_zone_ = 0;
+    buffers_.reserve(ZSG_SUB_GROUP);
   }
 
   ~ZoneStripingGroup();
@@ -255,7 +259,7 @@ class ZoneStripingGroup {
   }
 
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
-  void Append(int id, void *data, size_t size);
+  void Append(int id, void *data, size_t size, IODebugContext *dbg);
   void Fsync(ZoneFile *zonefile, int id);
   void PushExtents(ZoneFile *zonefile);
   int CheckReadyZones(size_t filled);

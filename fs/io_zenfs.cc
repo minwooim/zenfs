@@ -421,7 +421,7 @@ void ZoneFile::PushExtent() {
 		  active_zone_->used_capacity_.load());
 }
 
-void ZoneFile::Append(void *data, int data_size) {
+void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
   if (!zsg_) {
     int id;
     zsg_ = zbd_->AllocateZoneStripingGroup(&id);
@@ -430,7 +430,7 @@ void ZoneFile::Append(void *data, int data_size) {
     id_in_zsg_ = id;
   }
 
-  zsg_->Append(id_in_zsg_, data, data_size);
+  zsg_->Append(id_in_zsg_, data, data_size, dbg);
   fileSize += data_size;
   if (fileSize > ZSG_ZONE_SIZE * ZSG_ZONES / ZSG_FILES) {
     printf("%s filesize %ld exceeded %lld\n",  filename_.c_str(), fileSize,
@@ -726,9 +726,9 @@ IOStatus ZonedWritableFile::Append(const Slice& data,
 
 IOStatus ZonedWritableFile::PositionedAppend(const Slice& data, uint64_t /*offset*/,
                                              const IOOptions& /*options*/,
-                                             IODebugContext* /*dbg*/) {
+                                             IODebugContext* dbg) {
   // We can say that this case is only for sst files.
-  zoneFile_->Append((void *) data.data(), data.size());
+  zoneFile_->Append((void *) data.data(), data.size(), dbg);
   wp += data.size();
   return IOStatus::OK();
 }
