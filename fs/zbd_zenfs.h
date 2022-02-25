@@ -32,10 +32,14 @@
 #define ZSG_WRITERS       (32)
 // Number of zones being striped for a SSTable
 #define ZSG_ZONES         (32)  // --write_buffer_size / --target_file_size_base
+
+#define ZSG_SUB_GROUP     (ZSG_ZONES / ZSG_WRITERS)
+
 // Number of SSTables in a single zone.
 #define ZSG_FILES         (1)  // 1 or ZSG_ZONES
 // Size of a buffer for a zone striping group
 #define ZSG_ZONE_SIZE     (96ULL * 1024ULL * 1024ULL)
+#define ZSG_SUB_GROUP_SIZE  (ZSG_WRITERS * ZSG_ZONE_SIZE)
 #define ZSG_PER_ZONE_BUFFER   (ZSG_ZONE_SIZE / ZSG_FILES)
 // Actual size of a SSTable
 #define ZSG_BUFFER_SIZE   ((size_t) ZSG_PER_ZONE_BUFFER * (size_t) ZSG_ZONES)
@@ -144,6 +148,12 @@ class ZoneStripingGroup {
   // be reset until this group is destroyed (all SSTables are removed).
   int total_sst_files_;
 
+  // Concurrent writers
+  std::array<std::atomic_bool, ZSG_SUB_GROUP> sub_group_busy_;
+  int current_sub_group_;
+  std::vector<std::thread> sub_group_threads_;
+  size_t sub_group_written_;
+
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
     zbd_ = zbd;
@@ -161,6 +171,13 @@ class ZoneStripingGroup {
 
     // nr_zones == number of files in a zone
     buffers_.resize(nr_zones);
+
+    for (auto& x : sub_group_busy_) {
+      std::atomic_init(&x, false);
+    }
+    current_sub_group_ = 0;
+    sub_group_threads_.reserve(ZSG_SUB_GROUP);
+    sub_group_written_ = 0;
   }
 
   ~ZoneStripingGroup();
@@ -223,10 +240,26 @@ class ZoneStripingGroup {
     state_ = state;
   }
 
+  inline bool GetSubGroup(int sub_group) {
+    bool expected = false;
+    return sub_group_busy_[sub_group].compare_exchange_strong(
+                            expected, true, std::memory_order_acq_rel);
+  }
+
+  inline bool IsSubGroupBusy(int sub_group) {
+    return sub_group_busy_[sub_group].load();
+  }
+
+  inline uint64_t GetSubGroupOffset(int sub_group) {
+    return sub_group * ZSG_SUB_GROUP_SIZE;
+  }
+
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
   void Append(int id, void *data, size_t size);
   void Fsync(ZoneFile *zonefile, int id);
   void PushExtents(ZoneFile *zonefile);
+  int CheckReadyZones(size_t filled);
+  void WriteSubGroup(int sub_group, AlignedBuffer *buf);
 };
 
 template <typename T>
