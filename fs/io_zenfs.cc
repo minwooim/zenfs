@@ -301,6 +301,80 @@ ZoneExtent* ZoneFile::GetExtent(uint64_t file_offset, uint64_t* dev_offset) {
   return NULL;
 }
 
+static void BGWorkConcurrentRead(int fd, uint64_t src, char *dst, size_t size) {
+  const size_t unit = 128 * 1024;
+  size_t left = size;
+  ssize_t s;
+
+  while (left) {
+    size_t each = (unit < left) ? unit : left;
+
+    s = pread(fd, dst, each, src);
+
+    src += s;
+    dst += s;
+    left = (left < each) ? 0 : left - each;
+  }
+}
+
+void ZoneFile::GetExtentList(uint64_t offset, size_t n,
+                             std::vector<ZoneExtent*>& lst,
+                             uint64_t& first_offset) {
+  size_t left = n;
+  bool first = true;
+
+  offset += extents_[0]->start_;
+
+  for (unsigned int i = 0; i < extents_.size(); i++) {
+    if (!left) {
+      break;
+    }
+
+    if (offset < extents_[i]->start_ + extents_[i]->length_) {
+      size_t size = extents_[i]->start_ + extents_[i]->length_ - offset;
+
+      if (first) {
+        first_offset = offset;
+        first = false;
+      }
+
+      left = (left < size) ? 0 : left - size;
+      offset += size;
+      lst.push_back(extents_[i]);
+    }
+  }
+}
+
+IOStatus ZoneFile::ConcurrentRead(uint64_t offset, size_t n, Slice* result,
+                                  char* scratch, bool direct) {
+  int fd = (direct) ? zbd_->GetReadDirectFD() : zbd_->GetReadFD();
+  std::vector<ZoneExtent*> lst;
+  uint64_t first_offset;
+  uint64_t rel_offset = 0;
+
+  GetExtentList(offset, n, lst, first_offset);
+
+  for (unsigned int i = 0; i < lst.size(); i++) {
+    uint64_t _offset = (i == 0) ? first_offset : lst[i]->start_;
+    size_t size = lst[i]->start_ + lst[i]->length_ - _offset;
+
+    thread_pool_.push_back(std::thread(BGWorkConcurrentRead,
+                                       fd, _offset, scratch + rel_offset,
+                                       size));
+
+    rel_offset += size;
+  }
+
+  for (auto& thread : thread_pool_) {
+    thread.join();
+  }
+  thread_pool_.clear();
+
+  *result = Slice((char*)scratch, n);
+
+  return IOStatus::OK();
+}
+
 IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
                                   char* scratch, bool direct) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_READ_LATENCY,
@@ -765,7 +839,11 @@ IOStatus ZonedSequentialFile::PositionedRead(uint64_t offset, size_t n,
 IOStatus ZonedRandomAccessFile::Read(uint64_t offset, size_t n,
                                      const IOOptions& /*options*/,
                                      Slice* result, char* scratch,
-                                     IODebugContext* /*dbg*/) const {
+                                     IODebugContext* dbg) const {
+  if (dbg && dbg->for_compaction_) {
+    return zoneFile_->ConcurrentRead(offset, n, result, scratch, direct_);
+  }
+
   return zoneFile_->PositionedRead(offset, n, result, scratch, direct_);
 }
 

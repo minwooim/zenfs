@@ -92,6 +92,11 @@ class ZoneFile {
   std::vector<ZoneExtent*> GetExtents() { return extents_; }
   Env::WriteLifeTimeHint GetWriteLifeTimeHint() { return lifetime_; }
 
+  void GetExtentList(uint64_t offset, size_t n,
+                     std::vector<ZoneExtent*>& lst,
+                     uint64_t& first_offset);
+  IOStatus ConcurrentRead(uint64_t offset, size_t n, Slice* result,
+                          char* scratch, bool direct);
   IOStatus PositionedRead(uint64_t offset, size_t n, Slice* result,
                           char* scratch, bool direct);
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
@@ -124,6 +129,9 @@ class ZoneFile {
 
  public:
   bool deleted_;
+
+  // For concurrent reads
+  std::vector<std::thread> thread_pool_;
 };
 
 class ZonedWritableFile : public FSWritableFile {
