@@ -132,6 +132,7 @@ IOStatus Zone::Finish() {
   int fd = zbd_->GetWriteFD();
   int ret;
 
+  ROCKS_LOG_INFO(_logger, "zone %ld finished", GetZoneId());
   ret = zbd_finish_zones(fd, start_, zone_sz);
   if (ret) return IOStatus::IOError("Zone finish failed\n");
 
@@ -363,7 +364,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
         io_zones.push_back(newZone);
 
         // XXX: remove temporary condition for start zone
-        if (newZone->id_ >= ZSG_START_ZONE) {
+        if (newZone->id_ >= ZSG_START_ZONE && i < ZSG_LAST_ZONE) {
         if (!(newZone->id_ % ZSG_ZONES)) {
             zsg = new ZoneStripingGroup(this, ZSG_ZONES,
                 newZone->id_ / ZSG_ZONES, logger_);
@@ -806,6 +807,7 @@ ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
     zsgq_.pop();
     nr_active_zsgs_++;
   } else {
+    abort();
     return nullptr;
   }
   zsgq_pop_mtx_.unlock();
@@ -818,25 +820,43 @@ ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
   return zsg;
 }
 
-static void BGWorkAppend(char *data, size_t size, Zone *zone,
+static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
+                         Zone *zone,
                          IODebugContext* /*dbg*/);
 
-void ZoneStripingGroup::Append(void *data, size_t size, IODebugContext *dbg) {
+void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
+                               IODebugContext *dbg) {
   const size_t block_size = zbd_->GetBlockSize();
   char *_data = (char *) data;
   size_t left = size;
 
+  /*
   if (dbg) {
     buffers_.push_back(dbg);
   }
+  */
 
   while (left) {
     assert(current_zone_ < ZSG_ZONES);
     size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
     size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
+    Zone *z;
 
-    thread_pool_.push_back(std::thread(BGWorkAppend, _data,
-                                        aligned, zones_[current_zone_++],
+    while (true) {
+      z = GetFreeZone();
+      if (z) {
+        break;
+      }
+    }
+    ROCKS_LOG_INFO(_logger, "%s: zsg %d, zone %ld, offset=0x%lx, size=0x%lx",
+        zonefile->GetFilename().c_str(), id_, z->GetZoneId(),
+        z->extent_start_, aligned);
+    zonefile->PushExtent(new ZoneExtent(z->extent_start_, aligned, z));
+    z->extent_start_ = z->wp_ + aligned;
+    z->used_capacity_ += aligned;
+
+    thread_pool_.push_back(std::thread(BGWorkAppend, this, _data,
+                                        aligned, z,
                                         dbg));
 
     _data += aligned;
@@ -844,8 +864,9 @@ void ZoneStripingGroup::Append(void *data, size_t size, IODebugContext *dbg) {
   }
 }
 
-static void BGWorkAppend(char *data, size_t size, Zone *zone,
-                         IODebugContext* /*dbg*/) {
+static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
+                         Zone *zone,
+                         IODebugContext* dbg) {
   IOStatus s;
 
   s = zone->Append(data, size);
@@ -853,10 +874,22 @@ static void BGWorkAppend(char *data, size_t size, Zone *zone,
     ROCKS_LOG_ERROR(_logger, " zone %ld append pwrite failed, nr_active_zsgs=%d",
         zone->GetZoneId(), zone->zbd_->nr_active_zsgs_.load());
   }
-  zone->Finish();
+
+  dbg->buf_->RefitTail(dbg->file_advance_, dbg->leftover_tail_);
+  delete dbg->buf_->Release();
+
+  if (zone->capacity_ < ZSG_ZONE_SIZE) {
+    ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, finish",
+        zsg->id_, zone->GetZoneId());
+    zone->Finish();
+  } else {
+    ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, push free queue",
+        zsg->id_, zone->GetZoneId());
+    zsg->PutFreeZone(zone);
+  }
 }
 
-void ZoneStripingGroup::Fsync(ZoneFile *zonefile) {
+void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
   if (GetState() == ZSGState::kFull) {
     return;
   }
@@ -866,6 +899,7 @@ void ZoneStripingGroup::Fsync(ZoneFile *zonefile) {
   }
   thread_pool_.clear();
 
+  /*
   for (auto& dbg : buffers_) {
     // Here, we must refit the buffer after all data written.  This should have
     // been done from writable_file_writer.cc right after the PositionedAppend
@@ -874,8 +908,13 @@ void ZoneStripingGroup::Fsync(ZoneFile *zonefile) {
     delete dbg->buf_->Release();
   }
   buffers_.clear();
+  */
 
-  PushExtents(zonefile);
+  // PushExtents(zonefile);
+  Zone *z;
+  while ((z = GetFreeZone())) {
+    z->Finish();
+  }
 
   zbd_->nr_active_zsgs_--;
 

@@ -30,14 +30,15 @@
 #include "util/aligned_buffer.h"
 
 // Number of zones being striped for a SSTable
-#define ZSG_ZONES         (32)
+#define ZSG_ZONES         (22)
+#define ZSG_LAST_ZONE     (40700)
 // Number of SSTables in a single zone.
 #define ZSG_FILES         (1)
 // Size of a buffer for a zone striping group
-#define ZSG_ZONE_SIZE     (96ULL * 1024 * 1024)
+#define ZSG_ZONE_SIZE     (24ULL * 1024 * 1024)
 // Actual size of a SSTable
 #define ZSG_ZONE_LIMIT    (350)
-#define ZSG_START_ZONE    (1024)
+#define ZSG_START_ZONE    (ZSG_ZONES * 5)
 #define ZSG_MAX_OPEN_GROUP (ZSG_ZONE_LIMIT / ZSG_ZONES)
 
 namespace ROCKSDB_NAMESPACE {
@@ -142,6 +143,10 @@ class ZoneStripingGroup {
 
   std::vector<IODebugContext *> buffers_;
 
+  // Available zone list
+  std::queue<Zone *> free_zones_;
+  std::mutex free_zones_mtx_;
+
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
     zbd_ = zbd;
@@ -178,6 +183,33 @@ class ZoneStripingGroup {
     zones_[current_nr_zones_++] = zone;
     Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
         id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
+
+    free_zones_.push(zone);
+  }
+
+  void ResetFreeZones() {
+    for (auto& zone : zones_) {
+      free_zones_.push(zone);
+    }
+  }
+
+  Zone *GetFreeZone() {
+    free_zones_mtx_.lock();
+    if (free_zones_.empty()) {
+      free_zones_mtx_.unlock();
+      return nullptr;
+    }
+
+    Zone *z = free_zones_.front();
+    free_zones_.pop();
+    free_zones_mtx_.unlock();
+    return z;
+  }
+
+  void PutFreeZone(Zone *zone) {
+    free_zones_mtx_.lock();
+    free_zones_.push(zone);
+    free_zones_mtx_.unlock();
   }
 
   bool IsFull() {
@@ -209,7 +241,7 @@ class ZoneStripingGroup {
   }
 
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
-  void Append(void *data, size_t size, IODebugContext *dbg);
+  void Append(ZoneFile *zonefile, void *data, size_t size, IODebugContext *dbg);
   void Fsync(ZoneFile *zonefile);
   void PushExtents(ZoneFile *zonefile);
 };
