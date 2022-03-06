@@ -345,7 +345,10 @@ void ZoneFile::GetExtentList(uint64_t offset, size_t n,
       break;
     }
 
-    left = (left < extents_[i]->length_) ? 0 : left - extents_[i]->length_;
+    size_t _size = (i == first_extent) ?
+                      extents_[i]->length_ - offset : extents_[i]->length_;
+
+    left = (left < _size) ? 0 : left - _size;
     lst.push_back(extents_[i]);
   }
 }
@@ -357,6 +360,7 @@ IOStatus ZoneFile::ConcurrentRead(uint64_t offset, size_t n, Slice* result,
   uint64_t first_offset;
   uint64_t rel_offset = 0;
   std::vector<std::thread> thread_pool;
+  size_t left = n;
 
   if (offset >= fileSize) {
     *result = Slice(scratch, 0);
@@ -374,13 +378,21 @@ IOStatus ZoneFile::ConcurrentRead(uint64_t offset, size_t n, Slice* result,
   }
 
   for (unsigned int i = 0; i < lst.size(); i++) {
+    if (!left) {
+      break;
+    }
+
     uint64_t _offset = (i == 0) ? first_offset : lst[i]->start_;
     size_t size = lst[i]->start_ + lst[i]->length_ - _offset;
+    size = (size > left) ? left : size;
 
+    ROCKS_LOG_INFO(_logger, "      %s: extent[%u]: _offset=0x%lx, size=0x%lx",
+                   filename_.c_str(), i, _offset, size);
     thread_pool.push_back(std::thread(BGWorkConcurrentRead,
                                       fd, _offset, scratch + rel_offset,
                                       size));
     rel_offset += size;
+    left -= size;
   }
 
   for (auto& thread : thread_pool) {
