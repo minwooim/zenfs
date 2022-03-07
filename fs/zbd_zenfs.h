@@ -35,7 +35,7 @@
 // Number of SSTables in a single zone.
 #define ZSG_FILES         (1)
 // Size of a buffer for a zone striping group
-#define ZSG_ZONE_SIZE     (24ULL * 1024 * 1024)
+#define ZSG_ZONE_SIZE     (3ULL * 1024 * 1024)
 // Actual size of a SSTable
 #define ZSG_ZONE_LIMIT    (350)
 #define ZSG_START_ZONE    (ZSG_ZONES * 5)
