@@ -684,15 +684,15 @@ IOStatus ZonedWritableFile::Fsync(const IOOptions& /*options*/,
   // We need to keep going for the last footer metdata blocks.
   if (zoneFile_->InZSG()) {
     zoneFile_->Fsync();
+  } else {
+    buffer_mtx_.lock();
+    s = FlushBuffer();
+    buffer_mtx_.unlock();
+    if (!s.ok()) {
+      return s;
+    }
+    zoneFile_->PushExtent();
   }
-
-  buffer_mtx_.lock();
-  s = FlushBuffer();
-  buffer_mtx_.unlock();
-  if (!s.ok()) {
-    return s;
-  }
-  zoneFile_->PushExtent();
 
   return metadata_writer_->Persist(zoneFile_);
 }
