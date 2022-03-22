@@ -801,7 +801,7 @@ void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
 ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
   ZoneStripingGroup *zsg;
 
-  zsgq_.try_dequeue(zsg);
+  zsgq_.try_pop(zsg);
   nr_active_zsgs_++;
 
   zsg->current_sst_files_++;

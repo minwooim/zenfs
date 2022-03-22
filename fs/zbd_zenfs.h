@@ -23,6 +23,7 @@
 #include <queue>
 
 #include "concurrentqueue.h"
+#include <tbb/concurrent_queue.h>
 
 #include "metrics.h"
 #include "rocksdb/env.h"
@@ -146,7 +147,7 @@ class ZoneStripingGroup {
   std::vector<IODebugContext *> buffers_;
 
   // Available zone list
-  moodycamel::ConcurrentQueue<Zone*> free_zones_;
+  tbb::concurrent_queue<Zone*> free_zones_;
 
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
@@ -185,19 +186,19 @@ class ZoneStripingGroup {
     Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
         id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
 
-    free_zones_.enqueue(zone);
+    free_zones_.push(zone);
   }
 
   void ResetFreeZones() {
     for (auto& zone : zones_) {
-      free_zones_.enqueue(zone);
+      free_zones_.push(zone);
     }
   }
 
   Zone *GetFreeZone() {
     Zone* z;
 
-    if (free_zones_.try_dequeue(z)) {
+    if (free_zones_.try_pop(z)) {
       return z;
     }
 
@@ -205,7 +206,7 @@ class ZoneStripingGroup {
   }
 
   void PutFreeZone(Zone *zone) {
-    free_zones_.enqueue(zone);
+    free_zones_.push(zone);
   }
 
   bool IsFull() {
@@ -275,7 +276,7 @@ class ZonedBlockDevice {
   uint32_t block_sz_;
   uint64_t zone_sz_;
   uint32_t nr_zones_;
-  moodycamel::ConcurrentQueue<ZoneStripingGroup*> zsgq_;
+  tbb::concurrent_queue<ZoneStripingGroup*> zsgq_;
   std::vector<Zone *> io_zones;
   std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
@@ -353,7 +354,7 @@ class ZonedBlockDevice {
   ZoneStripingGroup *AllocateZoneStripingGroup();
 
   inline void PushToZSGQ(ZoneStripingGroup *zsg) {
-    zsgq_.enqueue(zsg);
+    zsgq_.push(zsg);
   };
 
   // number of active zones (open, closed) within ZSG
