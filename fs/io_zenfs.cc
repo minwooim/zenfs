@@ -264,9 +264,7 @@ ZoneFile::~ZoneFile() {
     zsg_->ResetFreeZones();
     zsg_->SetState(ZSGState::kEmpty);
 
-    zbd->zsgq_push_mtx_.lock();
     zbd->PushToZSGQ(zsg_);
-    zbd->zsgq_push_mtx_.unlock();
   }
 }
 

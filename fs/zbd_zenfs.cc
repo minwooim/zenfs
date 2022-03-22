@@ -801,16 +801,8 @@ void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
 ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
   ZoneStripingGroup *zsg;
 
-  zsgq_pop_mtx_.lock();
-  if (!zsgq_.empty()) {
-    zsg = zsgq_.front();
-    zsgq_.pop();
-    nr_active_zsgs_++;
-  } else {
-    abort();
-    return nullptr;
-  }
-  zsgq_pop_mtx_.unlock();
+  zsgq_.try_dequeue(zsg);
+  nr_active_zsgs_++;
 
   zsg->current_sst_files_++;
   zsg->total_sst_files_++;

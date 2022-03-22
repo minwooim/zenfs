@@ -22,6 +22,8 @@
 #include <vector>
 #include <queue>
 
+#include "concurrentqueue.h"
+
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
@@ -144,8 +146,7 @@ class ZoneStripingGroup {
   std::vector<IODebugContext *> buffers_;
 
   // Available zone list
-  std::queue<Zone *> free_zones_;
-  std::mutex free_zones_mtx_;
+  moodycamel::ConcurrentQueue<Zone*> free_zones_;
 
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
@@ -184,32 +185,27 @@ class ZoneStripingGroup {
     Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
         id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
 
-    free_zones_.push(zone);
+    free_zones_.enqueue(zone);
   }
 
   void ResetFreeZones() {
     for (auto& zone : zones_) {
-      free_zones_.push(zone);
+      free_zones_.enqueue(zone);
     }
   }
 
   Zone *GetFreeZone() {
-    free_zones_mtx_.lock();
-    if (free_zones_.empty()) {
-      free_zones_mtx_.unlock();
-      return nullptr;
+    Zone* z;
+
+    if (free_zones_.try_dequeue(z)) {
+      return z;
     }
 
-    Zone *z = free_zones_.front();
-    free_zones_.pop();
-    free_zones_mtx_.unlock();
-    return z;
+    return nullptr;
   }
 
   void PutFreeZone(Zone *zone) {
-    free_zones_mtx_.lock();
-    free_zones_.push(zone);
-    free_zones_mtx_.unlock();
+    free_zones_.enqueue(zone);
   }
 
   bool IsFull() {
@@ -279,7 +275,7 @@ class ZonedBlockDevice {
   uint32_t block_sz_;
   uint64_t zone_sz_;
   uint32_t nr_zones_;
-  std::queue<ZoneStripingGroup *> zsgq_;
+  moodycamel::ConcurrentQueue<ZoneStripingGroup*> zsgq_;
   std::vector<Zone *> io_zones;
   std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
@@ -357,7 +353,7 @@ class ZonedBlockDevice {
   ZoneStripingGroup *AllocateZoneStripingGroup();
 
   inline void PushToZSGQ(ZoneStripingGroup *zsg) {
-    zsgq_.push(zsg);
+    zsgq_.enqueue(zsg);
   };
 
   // number of active zones (open, closed) within ZSG
