@@ -813,20 +813,14 @@ ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
 }
 
 static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
-                         Zone *zone,
-                         IODebugContext* /*dbg*/);
+                         Zone *zone, AlignedBuffer *buf,
+                         size_t file_advance, size_t leftover_tail);
 
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
   const size_t block_size = zbd_->GetBlockSize();
   char *_data = (char *) data;
   size_t left = size;
-
-  /*
-  if (dbg) {
-    buffers_.push_back(dbg);
-  }
-  */
 
   while (left) {
     assert(current_zone_ < ZSG_ZONES);
@@ -848,8 +842,8 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
     z->used_capacity_ += aligned;
 
     thread_pool_.push_back(std::thread(BGWorkAppend, this, _data,
-                                        aligned, z,
-                                        dbg));
+                                        aligned, z, dbg->buf_,
+                                        dbg->file_advance_, dbg->leftover_tail_));
 
     _data += aligned;
     left = (left < aligned) ? 0 : left - aligned;
@@ -857,8 +851,8 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
 }
 
 static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
-                         Zone *zone,
-                         IODebugContext* dbg) {
+                         Zone *zone, AlignedBuffer *buf,
+                         size_t file_advance, size_t leftover_tail) {
   IOStatus s;
 
   s = zone->Append(data, size);
@@ -867,8 +861,8 @@ static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
         zone->GetZoneId(), zone->zbd_->nr_active_zsgs_.load());
   }
 
-  dbg->buf_->RefitTail(dbg->file_advance_, dbg->leftover_tail_);
-  delete dbg->buf_->Release();
+  buf->RefitTail(file_advance, leftover_tail);
+  delete buf->Release();
 
   if (zone->capacity_ < ZSG_ZONE_SIZE) {
     ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, finish",
