@@ -814,7 +814,8 @@ ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
 
 static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
-                         size_t file_advance, size_t leftover_tail);
+                         size_t file_advance, size_t leftover_tail,
+                         int zoneid);
 
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
@@ -826,14 +827,11 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
     assert(current_zone_ < ZSG_ZONES);
     size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
     size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
-    Zone *z;
+    Zone *z = zones_[current_zone_];
 
-    while (true) {
-      z = GetFreeZone();
-      if (z) {
-        break;
-      }
-    }
+    while (ck_bitmap_test(&used_bitmap_, current_zone_));
+    ck_bitmap_set(&used_bitmap_, current_zone_);
+
     ROCKS_LOG_INFO(_logger, "%s: zsg %d, zone %ld, offset=0x%lx, size=0x%lx",
         zonefile->GetFilename().c_str(), id_, z->GetZoneId(),
         z->extent_start_, aligned);
@@ -843,16 +841,23 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
 
     thread_pool_.push_back(std::thread(BGWorkAppend, this, _data,
                                         aligned, z, dbg->buf_,
-                                        dbg->file_advance_, dbg->leftover_tail_));
+                                        dbg->file_advance_, dbg->leftover_tail_,
+                                        current_zone_));
 
     _data += aligned;
     left = (left < aligned) ? 0 : left - aligned;
+
+    current_zone_++;
+    if (current_zone_ == ZSG_ZONES) {
+      current_zone_ = 0;
+    }
   }
 }
 
 static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
-                         size_t file_advance, size_t leftover_tail) {
+                         size_t file_advance, size_t leftover_tail,
+                         int zoneid) {
   IOStatus s;
 
   s = zone->Append(data, size);
@@ -871,7 +876,7 @@ static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
   } else {
     ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, push free queue",
         zsg->id_, zone->GetZoneId());
-    zsg->PutFreeZone(zone);
+    ck_bitmap_reset(&zsg->used_bitmap_, zoneid);
   }
 }
 
@@ -897,9 +902,9 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
   */
 
   // PushExtents(zonefile);
-  Zone *z;
-  while ((z = GetFreeZone())) {
-    z->Finish();
+  for (int i = 0; i < nr_zones_; i++) {
+    Zone *zone = zones_[i];
+    zone->Finish();
   }
 
   zbd_->nr_active_zsgs_--;

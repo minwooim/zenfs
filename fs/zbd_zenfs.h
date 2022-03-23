@@ -32,6 +32,8 @@
 #include "port/port_posix.h"
 #include "util/aligned_buffer.h"
 
+#include <ck_bitmap.h>
+
 // Number of zones being striped for a SSTable
 #define ZSG_ZONES         (22)
 #define ZSG_LAST_ZONE     (40700)
@@ -147,7 +149,7 @@ class ZoneStripingGroup {
   std::vector<IODebugContext *> buffers_;
 
   // Available zone list
-  tbb::concurrent_queue<Zone*> free_zones_;
+  ck_bitmap_t used_bitmap_;
 
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
@@ -165,6 +167,8 @@ class ZoneStripingGroup {
     total_sst_files_ = 0;
 
     current_zone_ = 0;
+
+    ck_bitmap_init(&used_bitmap_, ZSG_ZONES, 0);
   }
 
   ~ZoneStripingGroup();
@@ -185,28 +189,6 @@ class ZoneStripingGroup {
     zones_[current_nr_zones_++] = zone;
     Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
         id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
-
-    free_zones_.push(zone);
-  }
-
-  void ResetFreeZones() {
-    for (auto& zone : zones_) {
-      free_zones_.push(zone);
-    }
-  }
-
-  Zone *GetFreeZone() {
-    Zone* z;
-
-    if (free_zones_.try_pop(z)) {
-      return z;
-    }
-
-    return nullptr;
-  }
-
-  void PutFreeZone(Zone *zone) {
-    free_zones_.push(zone);
   }
 
   bool IsFull() {
