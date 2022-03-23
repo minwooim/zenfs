@@ -340,7 +340,6 @@ class ZonedBlockDevice {
   };
 
   // number of active zones (open, closed) within ZSG
-  std::atomic<int> nr_active_zsgs_;
   std::mutex zsgq_push_mtx_;
   std::mutex zsgpq_push_mtx_;
   std::mutex zsgq_pop_mtx_;

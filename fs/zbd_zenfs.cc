@@ -215,8 +215,6 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
                                    std::shared_ptr<ZenFSMetrics> metrics)
     : filename_("/dev/" + bdevname), logger_(logger), metrics_(metrics) {
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
-
-  nr_active_zsgs_ = 0;
 }
 
 std::string ZonedBlockDevice::ErrorToString(int err) {
@@ -802,7 +800,6 @@ ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
   ZoneStripingGroup *zsg;
 
   zsgq_.try_pop(zsg);
-  nr_active_zsgs_++;
 
   zsg->current_sst_files_++;
   zsg->total_sst_files_++;
@@ -862,8 +859,8 @@ static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
 
   s = zone->Append(data, size);
   if (!s.ok()) {
-    ROCKS_LOG_ERROR(_logger, " zone %ld append pwrite failed, nr_active_zsgs=%d",
-        zone->GetZoneId(), zone->zbd_->nr_active_zsgs_.load());
+    ROCKS_LOG_ERROR(_logger, " zone %ld append pwrite failed",
+        zone->GetZoneId());
   }
 
   buf->RefitTail(file_advance, leftover_tail);
@@ -906,8 +903,6 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
     Zone *zone = zones_[i];
     zone->Finish();
   }
-
-  zbd_->nr_active_zsgs_--;
 
   SetState(ZSGState::kFull);
 }
