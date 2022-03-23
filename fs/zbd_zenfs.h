@@ -147,7 +147,7 @@ class ZoneStripingGroup {
   int current_zone_;
 
   // Available zone list
-  ck_bitmap_t used_bitmap_;
+  CK_BITMAP_INSTANCE(ZSG_ZONES) used_bitmap_;
 
   ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
       std::shared_ptr<Logger> logger) {
@@ -166,7 +166,7 @@ class ZoneStripingGroup {
 
     current_zone_ = 0;
 
-    ck_bitmap_init(&used_bitmap_, ZSG_ZONES, 0);
+    CK_BITMAP_INIT(&used_bitmap_, ZSG_ZONES, 0);
   }
 
   ~ZoneStripingGroup();

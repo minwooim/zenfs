@@ -261,7 +261,7 @@ ZoneFile::~ZoneFile() {
     zsg_->total_sst_files_ = 0;
     zsg_->current_sst_files_ = 0;
     zsg_->current_zone_ = 0;
-    ck_bitmap_clear(&zsg_->used_bitmap_);
+    CK_BITMAP_CLEAR(&zsg_->used_bitmap_);
     zsg_->SetState(ZSGState::kEmpty);
 
     zbd->PushToZSGQ(zsg_);

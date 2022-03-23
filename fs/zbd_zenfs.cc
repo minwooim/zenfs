@@ -826,8 +826,8 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
     size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
     Zone *z = zones_[current_zone_];
 
-    while (ck_bitmap_test(&used_bitmap_, current_zone_));
-    ck_bitmap_set(&used_bitmap_, current_zone_);
+    while (CK_BITMAP_TEST(&used_bitmap_, current_zone_));
+    CK_BITMAP_SET(&used_bitmap_, current_zone_);
 
     ROCKS_LOG_INFO(_logger, "%s: zsg %d, zone %ld, offset=0x%lx, size=0x%lx",
         zonefile->GetFilename().c_str(), id_, z->GetZoneId(),
@@ -873,7 +873,7 @@ static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
   } else {
     ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, push free queue",
         zsg->id_, zone->GetZoneId());
-    ck_bitmap_reset(&zsg->used_bitmap_, zoneid);
+    CK_BITMAP_RESET(&zsg->used_bitmap_, zoneid);
   }
 }
 
