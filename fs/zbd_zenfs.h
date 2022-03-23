@@ -22,16 +22,16 @@
 #include <vector>
 #include <queue>
 
-#include "concurrentqueue.h"
 #include <tbb/concurrent_queue.h>
 
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "rocksdb/file_system.h"
-#include "port/port_posix.h"
-#include "util/aligned_buffer.h"
 
+// We should include port/port_posix.h for compatibiltiy, but we don't include
+// port/ directory in this header file.
+#include <thread>
 #include <ck_bitmap.h>
 
 // Number of zones being striped for a SSTable

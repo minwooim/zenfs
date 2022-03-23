@@ -33,6 +33,7 @@
 #include "rocksdb/io_status.h"
 #include "snapshot.h"
 #include "logging/logging.h"
+#include "util/aligned_buffer.h"
 
 #define KB (1024)
 #define MB (1024 * KB)
@@ -837,7 +838,8 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
     z->used_capacity_ += aligned;
 
     thread_pool_.push_back(std::thread(BGWorkAppend, this, _data,
-                                        aligned, z, dbg->buf_,
+                                        aligned, z,
+                                        static_cast<AlignedBuffer*>(dbg->buf_),
                                         dbg->file_advance_, dbg->leftover_tail_,
                                         current_zone_));
 
