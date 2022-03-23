@@ -887,18 +887,6 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
   }
   thread_pool_.clear();
 
-  /*
-  for (auto& dbg : buffers_) {
-    // Here, we must refit the buffer after all data written.  This should have
-    // been done from writable_file_writer.cc right after the PositionedAppend
-    // request.  We commented out that part and do it here.
-    dbg->buf_->RefitTail(dbg->file_advance_, dbg->leftover_tail_);
-    delete dbg->buf_->Release();
-  }
-  buffers_.clear();
-  */
-
-  // PushExtents(zonefile);
   for (int i = 0; i < nr_zones_; i++) {
     Zone *zone = zones_[i];
     zone->Finish();

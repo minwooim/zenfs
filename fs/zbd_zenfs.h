@@ -146,8 +146,6 @@ class ZoneStripingGroup {
 
   int current_zone_;
 
-  std::vector<IODebugContext *> buffers_;
-
   // Available zone list
   ck_bitmap_t used_bitmap_;
 
