@@ -42,9 +42,7 @@
 // Size of a buffer for a zone striping group
 #define ZSG_ZONE_SIZE     (1ULL * 1024 * 1024)
 // Actual size of a SSTable
-#define ZSG_ZONE_LIMIT    (350)
 #define ZSG_START_ZONE    (ZSG_ZONES * 5)
-#define ZSG_MAX_OPEN_GROUP (ZSG_ZONE_LIMIT / ZSG_ZONES)
 
 namespace ROCKSDB_NAMESPACE {
 

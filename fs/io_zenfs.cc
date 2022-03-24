@@ -531,13 +531,6 @@ void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
 
   zsg_->Append(this, data, data_size, dbg);
   fileSize += data_size;
-  /*
-  if (fileSize > ZSG_ZONE_SIZE * ZSG_ZONES / ZSG_FILES) {
-    printf("%s filesize %ld exceeded %lld\n",  filename_.c_str(), fileSize,
-        ZSG_ZONE_SIZE * ZSG_ZONES / ZSG_FILES);
-    abort();
-  }
-  */
 }
 
 /* Assumes that data and size are block aligned */
@@ -905,7 +898,6 @@ void ZoneFile::Fsync() {
   zsg_->Fsync(this);
 
   ROCKS_LOG_INFO(_logger, "file %s (size=%ld)", filename_.c_str(), fileSize);
-  // assert(fileSize <= ZSG_ZONE_SIZE * ZSG_ZONES / ZSG_FILES);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
