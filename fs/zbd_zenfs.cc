@@ -171,7 +171,6 @@ IOStatus Zone::Append(char *data, uint32_t size) {
   uint32_t unit = 128 * KB;
 
   if (capacity_ < size) {
-    printf("zone %ld capacity full\n", GetZoneId());
     ROCKS_LOG_ERROR(_logger, "zone append failed. zone %ld capacity full, cap=%ld, size=%u",
         GetZoneId(), capacity_, size);
     return IOStatus::NoSpace("Not enough capacity for append");
