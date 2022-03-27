@@ -34,15 +34,12 @@
 #include <thread>
 #include <ck_bitmap.h>
 
-// Number of zones being striped for a SSTable
-#define ZSG_ZONES         (22)
-#define ZSG_LAST_ZONE     (Rounddown(40700, ZSG_ZONES))
-// Number of SSTables in a single zone.
-#define ZSG_FILES         (1)
+#define ZSG_NR_ZONES      (40704)
 // Size of a buffer for a zone striping group
 #define ZSG_ZONE_SIZE     (1ULL * 1024 * 1024)
 // Actual size of a SSTable
-#define ZSG_START_ZONE    (ZSG_ZONES * 5)
+#define ZSG_START_ZONE    (16)
+#define ZSG_MAX_ACTIVE_ZONES  (256)
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -113,6 +110,7 @@ class Zone {
   }
 
   uint64_t wp_before_finish_;
+  bool finished_;
 };
 
 enum class ZSGState {
@@ -124,72 +122,14 @@ class ZoneStripingGroup {
  public:
   ZonedBlockDevice *zbd_;
   ZSGState state_;
-  int nr_zones_;
-  int id_;
-  int current_nr_zones_;
-  std::vector<Zone *> zones_;
-  std::shared_ptr<Logger> logger_;
-
   std::vector<std::thread> thread_pool_;
 
-  // Number of current SST files written
-
-  // Two cases where this variable is updated:
-  //   (1) ZonedBlockDevice::AllocateZoneStripingGroup
-  //   (2) ZoneFile::~ZoneFile()
-  int current_sst_files_;
-  // Number of total SSTables whether or not it's removed.  This value will not
-  // be reset until this group is destroyed (all SSTables are removed).
-  int total_sst_files_;
-
-  int current_zone_;
-
-  // Available zone list
-  CK_BITMAP_INSTANCE(ZSG_ZONES) used_bitmap_;
-
-  ZoneStripingGroup(ZonedBlockDevice *zbd, int nr_zones, int id,
-      std::shared_ptr<Logger> logger) {
+  ZoneStripingGroup(ZonedBlockDevice *zbd) {
     zbd_ = zbd;
     state_ = ZSGState::kEmpty;
-    nr_zones_ = nr_zones;
-    id_ = id;
-    current_nr_zones_ = 0;
-    zones_.resize(nr_zones);
-    logger_ = logger;
-
-    thread_pool_.reserve(nr_zones);
-
-    current_sst_files_ = 0;
-    total_sst_files_ = 0;
-
-    current_zone_ = 0;
-
-    CK_BITMAP_INIT(&used_bitmap_, ZSG_ZONES, 0);
   }
 
   ~ZoneStripingGroup();
-
-  uint64_t GetId() {
-    return id_;
-  }
-
-  int GetNumZones() {
-    return nr_zones_;
-  }
-
-  Zone *GetZone(int id) {
-    return zones_[id];
-  }
-
-  void AddZone(Zone *zone) {
-    zones_[current_nr_zones_++] = zone;
-    Info(logger_, "zsg[%d] (state=%d): add zone[%ld] (start=0x%lx)",
-        id_, (int)state_, zone->GetZoneId(), zone->GetStartLBA());
-  }
-
-  bool IsFull() {
-    return ZSG_FILES == total_sst_files_;
-  }
 
   ZSGState GetState() {
     return state_;
@@ -218,7 +158,6 @@ class ZoneStripingGroup {
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
   void Append(ZoneFile *zonefile, void *data, size_t size, IODebugContext *dbg);
   void Fsync(ZoneFile *zonefile);
-  void PushExtents(ZoneFile *zonefile);
 };
 
 template <typename T>
@@ -254,7 +193,6 @@ class ZonedBlockDevice {
   uint32_t block_sz_;
   uint64_t zone_sz_;
   uint32_t nr_zones_;
-  tbb::concurrent_queue<ZoneStripingGroup*> zsgq_;
   std::vector<Zone *> io_zones;
   std::mutex io_zones_mtx;
   std::vector<Zone *> meta_zones;
@@ -329,20 +267,24 @@ class ZonedBlockDevice {
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 
-  ZoneStripingGroup *AllocateZoneStripingGroup();
+  bool GetZone(Zone* z);
+  void PutZone(Zone* z);
+  bool BusyZone(Zone* z);
 
-  inline void PushToZSGQ(ZoneStripingGroup *zsg) {
-    zsgq_.push(zsg);
-  };
-
-  // number of active zones (open, closed) within ZSG
-  std::mutex zsgq_push_mtx_;
-  std::mutex zsgpq_push_mtx_;
-  std::mutex zsgq_pop_mtx_;
+  bool AllocateZSGZone(Zone*& zone);
+  bool GetPartialZone(Zone*& zone);
+  bool GetFreeZone(Zone*& zone);
 
  private:
   std::string ErrorToString(int err);
   IOStatus GetZoneDeferredStatus();
+
+ public:
+  std::atomic<int> active_zones_;
+  tbb::concurrent_queue<bool> zone_tokens_;
+  tbb::concurrent_queue<Zone*> free_zones_;
+  tbb::concurrent_queue<Zone*> partial_zones_;
+  CK_BITMAP_INSTANCE(ZSG_NR_ZONES) zone_bitmap_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -58,7 +58,8 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
       start_(zbd_zone_start(z)),
       max_capacity_(zbd_zone_capacity(z)),
       wp_(zbd_zone_wp(z)),
-      wp_before_finish_(wp_) {
+      wp_before_finish_(wp_),
+      finished_(false) {
   lifetime_ = Env::WLTH_NOT_SET;
   used_capacity_ = 0;
   capacity_ = 0;
@@ -125,6 +126,22 @@ IOStatus Zone::Reset() {
   lifetime_ = Env::WLTH_NOT_SET;
   extent_start_ = start_;
 
+  if (GetZoneId() >= ZSG_START_ZONE) {
+    if (!finished_) {
+      zbd_->active_zones_--;
+      zbd_->zone_tokens_.push(true);
+      ROCKS_LOG_INFO(_logger, "active: Zone reset, active_zones_=%d, tokens=%ld",
+                     zbd_->active_zones_.load(),
+                     zbd_->zone_tokens_.unsafe_size());
+    }
+
+    if (zbd_->BusyZone(this)) {
+      zbd_->PutZone(this);
+    }
+    zbd_->free_zones_.push(this);
+  }
+
+  finished_ = false;
   return IOStatus::OK();
 }
 
@@ -140,6 +157,7 @@ IOStatus Zone::Finish() {
   capacity_ = 0;
   wp_before_finish_ = wp_;
   wp_ = start_ + zone_sz;
+  finished_ = true;
 
   return IOStatus::OK();
 }
@@ -215,6 +233,12 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
                                    std::shared_ptr<ZenFSMetrics> metrics)
     : filename_("/dev/" + bdevname), logger_(logger), metrics_(metrics) {
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
+
+  active_zones_ = 0;
+  CK_BITMAP_INIT(&zone_bitmap_, ZSG_NR_ZONES, 0);
+  for (int i = 0; i < ZSG_MAX_ACTIVE_ZONES; i++) {
+    zone_tokens_.push(true);
+  }
 }
 
 std::string ZonedBlockDevice::ErrorToString(int err) {
@@ -345,8 +369,6 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   active_io_zones_ = 0;
   open_io_zones_ = 0;
 
-  ZoneStripingGroup *zsg = nullptr;
-
   for (; i < reported_zones; i++) {
     struct zbd_zone *z = &zone_rep[i];
     /* Only use sequential write required zones */
@@ -360,17 +382,9 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
         }
 
         io_zones.push_back(newZone);
-
-        // XXX: remove temporary condition for start zone
-        if (newZone->id_ >= ZSG_START_ZONE && i < ZSG_LAST_ZONE) {
-        if (!(newZone->id_ % ZSG_ZONES)) {
-            zsg = new ZoneStripingGroup(this, ZSG_ZONES,
-                newZone->id_ / ZSG_ZONES, logger_);
-            PushToZSGQ(zsg);
-            zsg->AddZone(newZone);
-        } else {
-            zsg->AddZone(newZone);
-        }
+        if (newZone->GetZoneId() >= ZSG_START_ZONE &&
+            newZone->GetZoneId() < ZSG_NR_ZONES) {
+          free_zones_.push(newZone);
         }
 
         if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z) ||
@@ -390,7 +404,6 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
 
   free(zone_rep);
   start_time_ = time(NULL);
-
   return IOStatus::OK();
 }
 
@@ -796,85 +809,130 @@ void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto &zone : io_zones) snapshot.emplace_back(*zone);
 }
 
-ZoneStripingGroup *ZonedBlockDevice::AllocateZoneStripingGroup() {
-  ZoneStripingGroup *zsg;
+bool ZonedBlockDevice::GetZone(Zone* z) {
+  if (CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId())) {
+    return false;
+  }
 
-  zsgq_.try_pop(zsg);
-
-  zsg->current_sst_files_++;
-  zsg->total_sst_files_++;
-  ROCKS_LOG_INFO(_logger, "zsg %d, first zone %ld, total_sst_files_=%d",
-      zsg->id_, zsg->zones_[0]->GetZoneId(), zsg->total_sst_files_);
-
-  return zsg;
+  return !CK_BITMAP_BTS(&zone_bitmap_, z->GetZoneId());
 }
 
-static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
+void ZonedBlockDevice::PutZone(Zone* z) {
+  assert(CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId()));
+  CK_BITMAP_RESET(&zone_bitmap_, z->GetZoneId());
+}
+
+bool ZonedBlockDevice::BusyZone(Zone* z) {
+  return CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId());
+}
+
+bool ZonedBlockDevice::GetPartialZone(Zone*& zone) {
+  if (partial_zones_.try_pop(zone)) {
+    if (GetZone(zone)) {
+      return true;
+    } else {
+      printf("ZonedBlockDevice::GetPartialZone(): failed to get zone (1)\n");
+      abort();
+    }
+  }
+
+  return false;
+}
+
+bool ZonedBlockDevice::GetFreeZone(Zone*& zone) {
+  if (free_zones_.try_pop(zone)) {
+    if (GetZone(zone)) {
+      active_zones_++;
+      return true;
+    } else {
+      printf("ZonedBlockDevice::GetPartialZone(): failed to get zone (1)\n");
+      abort();
+    }
+  }
+
+  return false;
+}
+
+bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
+  bool token;
+
+  if (GetPartialZone(zone)) {
+    return true;
+  }
+
+  if (!zone_tokens_.try_pop(token)) {
+    if (!GetPartialZone(zone)) {
+      return false;
+    } else {
+      return true;
+    }
+  }
+
+  if (!GetFreeZone(zone)) {
+    zone_tokens_.push(token);
+    return false;
+  }
+
+  ROCKS_LOG_INFO(_logger, "active: Free zone allocated, active_zones_=%d, tokens=%ld",
+                 active_zones_.load(), zone_tokens_.unsafe_size());
+  return true;
+}
+
+static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
-                         size_t file_advance, size_t leftover_tail,
-                         int zoneid);
+                         size_t file_advance, size_t leftover_tail);
 
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
   const size_t block_size = zbd_->GetBlockSize();
+  size_t each = (size < ZSG_ZONE_SIZE) ? size : ZSG_ZONE_SIZE;
+  size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
   char *_data = (char *) data;
-  size_t left = size;
+  Zone* z;
 
-  while (left) {
-    assert(current_zone_ < ZSG_ZONES);
-    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
-    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
-    Zone *z = zones_[current_zone_];
-
-    while (CK_BITMAP_TEST(&used_bitmap_, current_zone_));
-    CK_BITMAP_SET(&used_bitmap_, current_zone_);
-
-    ROCKS_LOG_INFO(_logger, "%s: zsg %d, zone %ld, offset=0x%lx, size=0x%lx",
-        zonefile->GetFilename().c_str(), id_, z->GetZoneId(),
-        z->extent_start_, aligned);
-    zonefile->PushExtent(new ZoneExtent(z->extent_start_, aligned, z));
-    z->extent_start_ = z->wp_ + aligned;
-    z->used_capacity_ += aligned;
-
-    thread_pool_.push_back(std::thread(BGWorkAppend, this, _data,
-                                        aligned, z,
-                                        static_cast<AlignedBuffer*>(dbg->buf_),
-                                        dbg->file_advance_, dbg->leftover_tail_,
-                                        current_zone_));
-
-    _data += aligned;
-    left = (left < aligned) ? 0 : left - aligned;
-
-    current_zone_++;
-    if (current_zone_ == ZSG_ZONES) {
-      current_zone_ = 0;
-    }
+  while (!zbd_->AllocateZSGZone(z)) {
+    ROCKS_LOG_INFO(_logger, "%s: Waiting for zone allocation.. partial=%ld, free=%ld, tokens=%ld",
+                   zonefile->GetFilename().c_str(),
+                   zbd_->partial_zones_.unsafe_size(),
+                   zbd_->free_zones_.unsafe_size(),
+                   zbd_->zone_tokens_.unsafe_size());
   }
+  ROCKS_LOG_INFO(_logger, "%s: Zone allocated, zoneid=%ld, current_active_zones=%d",
+                 zonefile->GetFilename().c_str(), z->GetZoneId(), zbd_->active_zones_.load());
+
+  zonefile->PushExtent(new ZoneExtent(z->extent_start_, aligned, z));
+  z->extent_start_ = z->wp_ + aligned;
+  z->used_capacity_ += aligned;
+  thread_pool_.push_back(std::thread(BGWorkAppend, _data,
+                                     aligned, z,
+                                     static_cast<AlignedBuffer*>(dbg->buf_),
+                                     dbg->file_advance_, dbg->leftover_tail_));
 }
 
-static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
+static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
-                         size_t file_advance, size_t leftover_tail,
-                         int zoneid) {
+                         size_t file_advance, size_t leftover_tail) {
   IOStatus s;
 
   s = zone->Append(data, size);
   if (!s.ok()) {
-    ROCKS_LOG_ERROR(_logger, " zone %ld append pwrite failed",
-        zone->GetZoneId());
+    printf("pwrite() failed, zone=%ld\n", zone->GetZoneId());
+    abort();
   }
 
   buf->RefitTail(file_advance, leftover_tail);
   delete buf->Release();
 
   if (zone->capacity_ < ZSG_ZONE_SIZE) {
-    ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, finish",
-        zsg->id_, zone->GetZoneId());
     zone->Finish();
+    zone->zbd_->active_zones_--;
+    zone->zbd_->zone_tokens_.push(true);
+    ROCKS_LOG_INFO(_logger, "active: Zone finished, active_zones_=%d, tokens=%ld",
+                   zone->zbd_->active_zones_.load(),
+                   zone->zbd_->zone_tokens_.unsafe_size());
   } else {
-    ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, push free queue",
-        zsg->id_, zone->GetZoneId());
-    CK_BITMAP_RESET(&zsg->used_bitmap_, zoneid);
+    zone->zbd_->PutZone(zone);
+    zone->zbd_->partial_zones_.push(zone);
   }
 }
 
@@ -888,40 +946,7 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
   }
   thread_pool_.clear();
 
-  for (int i = 0; i < nr_zones_; i++) {
-    Zone *zone = zones_[i];
-    zone->Finish();
-  }
-
   SetState(ZSGState::kFull);
-}
-
-void ZoneStripingGroup::PushExtents(ZoneFile *zonefile) {
-  // Assume that we have finished writing data to zones
-  for (int i = 0; i < nr_zones_; i++) {
-    Zone *zone = zones_[i];
-    size_t length = zone->wp_before_finish_ - zone->extent_start_;
-
-    if (!length) {
-      ROCKS_LOG_WARN(_logger, "length is zero, zone %ld: start=0x%lx, wp=0x%lx, extent_start=0x%lx",
-          zone->GetZoneId(), zone->start_, zone->wp_, zone->extent_start_);
-      continue;
-    }
-
-    ROCKS_LOG_INFO(_logger,
-        "%s: zsg %d, push extent, zone %ld, start=0x%lx, length=0x%lx",
-        zonefile->GetFilename().c_str(), id_,
-        zone->GetZoneId(), zone->extent_start_, length);
-    zonefile->PushExtent(new ZoneExtent(zone->extent_start_, length, zone));
-    zone->used_capacity_ += length;
-    zone->extent_start_ = zone->wp_before_finish_;
-  }
-
-  if (zonefile->GetExtents().size() != (size_t) nr_zones_) {
-    ROCKS_LOG_WARN(_logger, "%s nr_extents=%d, nr_zones=%d mismatch",
-        zonefile->GetFilename().c_str(), (int) zonefile->GetExtents().size(),
-        nr_zones_);
-  }
 }
 
 }  // namespace ROCKSDB_NAMESPACE

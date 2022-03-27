@@ -222,49 +222,34 @@ void ZoneFile::SetFileSize(uint64_t sz) { fileSize = sz; }
 void ZoneFile::SetFileModificationTime(time_t mt) { m_time_ = mt; }
 
 ZoneFile::~ZoneFile() {
+  if (zsg_ && deleted_) {
+    ROCKS_LOG_INFO(_logger, "%s: File deleted", filename_.c_str());
+  }
+
   for (auto e = std::begin(extents_); e != std::end(extents_); ++e) {
     Zone* zone = (*e)->zone_;
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
-    delete *e;
-  }
-
-  if (zsg_ && deleted_) {
-    ROCKS_LOG_INFO(_logger, "deleted file=%s, current_sst_files=%d",
-        filename_.c_str(), zsg_->current_sst_files_);
-    zsg_->current_sst_files_--;
-    assert(zsg_->current_sst_files_ >= 0);
-
-    // When it reaches to zero, it means this group has no more files in it.
-    // We don't GC here, so just reset the zone here and put it into normal
-    // zone striping group queue.
-    if (!zsg_->current_sst_files_) {
-      // destroy this zone striping group
-      ROCKS_LOG_INFO(_logger, "destroy zsg %d",
-          zsg_->id_);
-      for (int i = 0; i < zsg_->nr_zones_; i++) {
-        Zone *zone = zsg_->zones_[i];
+    if (!zone->used_capacity_) {
+      if (zone->finished_) {
         zone->Reset();
+      } else {
+        if (zbd_->GetZone(zone)) {
+          if (!zone->used_capacity_) {
+            zone->Reset();
+          } else {
+            zbd_->PutZone(zone);
+          }
+        }
       }
     }
+    delete *e;
   }
 
   IOStatus s = CloseWR();
   if (!s.ok()) {
     zbd_->SetZoneDeferredStatus(s);
-  }
-
-  if (zsg_ && deleted_ && !zsg_->current_sst_files_) {
-    ZonedBlockDevice *zbd = zsg_->zbd_;
-    zsg_->current_nr_zones_ = 0;
-    zsg_->total_sst_files_ = 0;
-    zsg_->current_sst_files_ = 0;
-    zsg_->current_zone_ = 0;
-    CK_BITMAP_CLEAR(&zsg_->used_bitmap_);
-    zsg_->SetState(ZSGState::kEmpty);
-
-    zbd->PushToZSGQ(zsg_);
   }
 }
 
@@ -524,9 +509,7 @@ void ZoneFile::PushExtent() {
 
 void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
   if (!zsg_) {
-    zsg_ = zbd_->AllocateZoneStripingGroup();
-    ROCKS_LOG_INFO(_logger, "%s zone striping group %ld allocated",
-        filename_.c_str(), zsg_->GetId());
+    zsg_ = new ZoneStripingGroup(zbd_);
   }
 
   zsg_->Append(this, data, data_size, dbg);
