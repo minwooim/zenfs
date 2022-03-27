@@ -36,7 +36,7 @@
 
 // Number of zones being striped for a SSTable
 #define ZSG_ZONES         (22)
-#define ZSG_LAST_ZONE     (40700)
+#define ZSG_LAST_ZONE     (Rounddown(40700, ZSG_ZONES))
 // Number of SSTables in a single zone.
 #define ZSG_FILES         (1)
 // Size of a buffer for a zone striping group
