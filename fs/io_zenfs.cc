@@ -231,19 +231,13 @@ ZoneFile::~ZoneFile() {
 
     assert(zone && zone->used_capacity_ >= (*e)->length_);
     zone->used_capacity_ -= (*e)->length_;
-    if (!zone->used_capacity_) {
-      if (zone->finished_) {
+
+    if (deleted_) {
+      if (!zone->used_capacity_ && zone->finished_) {
         zone->Reset();
-      } else {
-        if (zbd_->GetZone(zone)) {
-          if (!zone->used_capacity_) {
-            zone->Reset();
-          } else {
-            zbd_->PutZone(zone);
-          }
-        }
       }
     }
+
     delete *e;
   }
 
