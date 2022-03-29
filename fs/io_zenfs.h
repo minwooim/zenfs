@@ -128,6 +128,12 @@ class ZoneFile {
 
  public:
   bool deleted_;
+  std::atomic<int> nr_zones_;
+  tbb::concurrent_queue<Zone*> zones_;
+
+  inline int Level() {
+    return LifetimeToLevel(lifetime_);
+  }
 };
 
 class ZonedWritableFile : public FSWritableFile {
