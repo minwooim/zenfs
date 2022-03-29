@@ -581,8 +581,8 @@ IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
 
 IOStatus ZoneFile::SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime) {
   lifetime_ = lifetime;
-  Debug(_logger, "ZoneFile::SetWriteLifeTimeHint(): file=%s, lifetime=%d",
-        filename_.c_str(), lifetime_);
+  Debug(_logger, "ZoneFile::SetWriteLifeTimeHint(): file=%s, lifetime=%d, level=%d",
+        filename_.c_str(), lifetime_, LifetimeToLevel(lifetime_));
   return IOStatus::OK();
 }
 

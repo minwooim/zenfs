@@ -40,6 +40,12 @@
 // Actual size of a SSTable
 #define ZSG_START_ZONE    (16)
 #define ZSG_MAX_ACTIVE_ZONES  (256)
+// Column family options. We just give hard-coded value along with db_bench
+#define ZSG_NR_LEVELS     (5) // default: 7
+#define ZSG_LEVEL_BASE    (4ULL * 1024 * 1024 * 1024) // default: 256MB
+#define ZSG_LEVEL_MUL     (4) // default: 10
+#define ZSG_WRITE_BUFFER_SIZE (2ULL * 1024 * 1024 * 1024) // default: 64MB
+#define ZSG_COMPACTION_TRIGGER  (4) // default: 4
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -111,6 +117,7 @@ class Zone {
 
   uint64_t wp_before_finish_;
   bool finished_;
+  int level_;
 };
 
 enum class ZSGState {
@@ -271,20 +278,31 @@ class ZonedBlockDevice {
   void PutZone(Zone* z);
   bool BusyZone(Zone* z);
 
-  bool AllocateZSGZone(Zone*& zone);
-  bool GetPartialZone(Zone*& zone);
-  bool GetFreeZone(Zone*& zone);
+  bool AllocateZSGZone(Zone*& zone, Env::WriteLifeTimeHint lifetime);
+  bool GetPartialZone(Zone*& zone, int level);
+  bool GetFreeZoneFromSpare(Zone*& zone, int from_level);
+  bool GetFreeZone(Zone*& zone, int level);
 
  private:
   std::string ErrorToString(int err);
   IOStatus GetZoneDeferredStatus();
 
  public:
+  std::vector<size_t> level_sizes_;
   std::atomic<int> active_zones_;
   tbb::concurrent_queue<bool> zone_tokens_;
-  tbb::concurrent_queue<Zone*> free_zones_;
-  tbb::concurrent_queue<Zone*> partial_zones_;
+  std::vector<tbb::concurrent_queue<Zone*>*> free_zones_;
+  std::vector<tbb::concurrent_queue<Zone*>*> partial_zones_;
   CK_BITMAP_INSTANCE(ZSG_NR_ZONES) zone_bitmap_;
 };
+
+inline int LifetimeToLevel(Env::WriteLifeTimeHint lifetime) {
+  assert(lifetime > 0);
+  return lifetime - 1;
+}
+
+inline Env::WriteLifeTimeHint LevelToLifetime(int level) {
+  return static_cast<Env::WriteLifeTimeHint>(level + 1);
+}
 
 }  // namespace ROCKSDB_NAMESPACE

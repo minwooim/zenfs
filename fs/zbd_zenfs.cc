@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <chrono>
+#include <cmath>
 
 #include <cstdlib>
 #include <fstream>
@@ -65,10 +66,6 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
   capacity_ = 0;
   if (!(zbd_zone_full(z) || zbd_zone_offline(z) || zbd_zone_rdonly(z)))
     capacity_ = zbd_zone_capacity(z) - (zbd_zone_wp(z) - zbd_zone_start(z));
-
-  Debug(_logger, "Zone::Zone(): zone[%ld] start_=0x%lx, capacity_=0x%lx",
-        this->start_ / this->max_capacity_, this->start_,
-        this->capacity_);
 
   extent_start_ = start_;
   id_ = start_ / zbd_zone_len(z);
@@ -123,22 +120,11 @@ IOStatus Zone::Reset() {
 
   wp_ = start_;
   wp_before_finish_ = start_;
-  lifetime_ = Env::WLTH_NOT_SET;
   extent_start_ = start_;
 
   if (GetZoneId() >= ZSG_START_ZONE) {
-    if (!finished_) {
-      zbd_->active_zones_--;
-      zbd_->zone_tokens_.push(true);
-      ROCKS_LOG_INFO(_logger, "active: Zone reset, active_zones_=%d, tokens=%ld",
-                     zbd_->active_zones_.load(),
-                     zbd_->zone_tokens_.unsafe_size());
-    }
-
-    if (zbd_->BusyZone(this)) {
-      zbd_->PutZone(this);
-    }
-    zbd_->free_zones_.push(this);
+    zbd_->PutZone(this);
+    zbd_->free_zones_[level_]->push(this);
   }
 
   finished_ = false;
@@ -149,6 +135,10 @@ IOStatus Zone::Finish() {
   size_t zone_sz = zbd_->GetZoneSize();
   int fd = zbd_->GetWriteFD();
   int ret;
+
+  if (GetZoneId() >= ZSG_START_ZONE) {
+    assert(zbd_->BusyZone(this));
+  }
 
   ROCKS_LOG_INFO(_logger, "zone %ld finished", GetZoneId());
   ret = zbd_finish_zones(fd, start_, zone_sz);
@@ -238,6 +228,18 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
   CK_BITMAP_INIT(&zone_bitmap_, ZSG_NR_ZONES, 0);
   for (int i = 0; i < ZSG_MAX_ACTIVE_ZONES; i++) {
     zone_tokens_.push(true);
+  }
+
+  level_sizes_.reserve(ZSG_NR_LEVELS);
+  // We keep the zone level list for level + 1 for free zones spare
+  for (int l = 0; l < ZSG_NR_LEVELS + 1; l++) {
+    free_zones_.push_back(new tbb::concurrent_queue<Zone*>);
+    partial_zones_.push_back(new tbb::concurrent_queue<Zone*>);
+  }
+
+  level_sizes_[0] = ZSG_WRITE_BUFFER_SIZE * ZSG_COMPACTION_TRIGGER;
+  for (int l = 1; l < ZSG_NR_LEVELS; l++) {
+    level_sizes_[l] = ZSG_LEVEL_BASE * std::pow(ZSG_LEVEL_MUL, l - 1);
   }
 }
 
@@ -369,6 +371,10 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   active_io_zones_ = 0;
   open_io_zones_ = 0;
 
+  size_t acc_size = 0;
+  int nr_zones = 0;
+  int level = 0;
+
   for (; i < reported_zones; i++) {
     struct zbd_zone *z = &zone_rep[i];
     /* Only use sequential write required zones */
@@ -382,9 +388,31 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
         }
 
         io_zones.push_back(newZone);
+
         if (newZone->GetZoneId() >= ZSG_START_ZONE &&
             newZone->GetZoneId() < ZSG_NR_ZONES) {
-          free_zones_.push(newZone);
+          if (level < ZSG_NR_LEVELS) {
+            if (acc_size < level_sizes_[level]) {
+              ROCKS_LOG_INFO(_logger, "Zone[%ld], level=%d",
+                             newZone->GetZoneId(), level);
+
+              free_zones_[level]->push(newZone);
+              acc_size += zone_sz_;
+              nr_zones++;
+              newZone->level_ = level;
+              newZone->lifetime_ = LevelToLifetime(level);
+            } else {
+              ROCKS_LOG_INFO(_logger, "Zone summary, level=%d, nr_zones=%d, acc_size=%ld",
+                             level, nr_zones, acc_size);
+
+              level++;
+              acc_size = 0;
+              nr_zones = 0;
+            }
+          } else {
+            ROCKS_LOG_INFO(_logger, "Zone[%ld], level=spare", newZone->GetZoneId());
+            free_zones_[ZSG_NR_LEVELS]->push(newZone);
+          }
         }
 
         if (zbd_zone_imp_open(z) || zbd_zone_exp_open(z) ||
@@ -826,8 +854,8 @@ bool ZonedBlockDevice::BusyZone(Zone* z) {
   return CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId());
 }
 
-bool ZonedBlockDevice::GetPartialZone(Zone*& zone) {
-  if (partial_zones_.try_pop(zone)) {
+bool ZonedBlockDevice::GetPartialZone(Zone*& zone, int level) {
+  if (partial_zones_[level]->try_pop(zone)) {
     if (GetZone(zone)) {
       return true;
     } else {
@@ -839,36 +867,58 @@ bool ZonedBlockDevice::GetPartialZone(Zone*& zone) {
   return false;
 }
 
-bool ZonedBlockDevice::GetFreeZone(Zone*& zone) {
-  if (free_zones_.try_pop(zone)) {
+bool ZonedBlockDevice::GetFreeZoneFromSpare(Zone*& zone, int from_level) {
+  const int spare = ZSG_NR_LEVELS;
+  if (free_zones_[spare]->try_pop(zone)) {
+    if (GetZone(zone)) {
+      // When this zone needs to be pushed to other queue, it should follow
+      // the level given.
+      zone->level_ = from_level;
+      zone->lifetime_ = LevelToLifetime(from_level);
+      active_zones_++;
+      return true;
+    } else {
+      printf("ZonedBlockDevice::GetFreeZoneFromSpare(): failed to get zone\n");
+      abort();
+    }
+  }
+
+  return false;
+}
+
+bool ZonedBlockDevice::GetFreeZone(Zone*& zone, int level) {
+  if (free_zones_[level]->try_pop(zone)) {
     if (GetZone(zone)) {
       active_zones_++;
       return true;
     } else {
-      printf("ZonedBlockDevice::GetPartialZone(): failed to get zone (1)\n");
+      printf("ZonedBlockDevice::GetFreeZone(): failed to get zone\n");
       abort();
     }
   }
 
-  return false;
+  // Borrow from the spare list or other level's queue
+  return GetFreeZoneFromSpare(zone, level);
 }
 
-bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
+bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone,
+                                       Env::WriteLifeTimeHint lifetime) {
   bool token;
+  int level = LifetimeToLevel(lifetime);
 
-  if (GetPartialZone(zone)) {
+  if (GetPartialZone(zone, level)) {
     return true;
   }
 
   if (!zone_tokens_.try_pop(token)) {
-    if (!GetPartialZone(zone)) {
+    if (!GetPartialZone(zone, level)) {
       return false;
     } else {
       return true;
     }
   }
 
-  if (!GetFreeZone(zone)) {
+  if (!GetFreeZone(zone, level)) {
     zone_tokens_.push(token);
     return false;
   }
@@ -889,16 +939,23 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
   size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
   char *_data = (char *) data;
   Zone* z;
+  int level = LifetimeToLevel(zonefile->GetWriteLifeTimeHint());
+  int spare = ZSG_NR_LEVELS;
 
-  while (!zbd_->AllocateZSGZone(z)) {
-    ROCKS_LOG_INFO(_logger, "%s: Waiting for zone allocation.. partial=%ld, free=%ld, tokens=%ld",
-                   zonefile->GetFilename().c_str(),
-                   zbd_->partial_zones_.unsafe_size(),
-                   zbd_->free_zones_.unsafe_size(),
+  while (!zbd_->AllocateZSGZone(z, zonefile->GetWriteLifeTimeHint())) {
+    ROCKS_LOG_INFO(_logger, "%s(level=%d): Waiting for zone allocation.. partial=%ld, free=%ld, spare=%ld, tokens=%ld",
+                   zonefile->GetFilename().c_str(), level,
+                   zbd_->partial_zones_[level]->unsafe_size(),
+                   zbd_->free_zones_[level]->unsafe_size(),
+                   zbd_->free_zones_[spare]->unsafe_size(),
                    zbd_->zone_tokens_.unsafe_size());
   }
-  ROCKS_LOG_INFO(_logger, "%s: Zone allocated, zoneid=%ld, current_active_zones=%d",
-                 zonefile->GetFilename().c_str(), z->GetZoneId(), zbd_->active_zones_.load());
+  assert(zbd_->BusyZone(z));
+  ROCKS_LOG_INFO(_logger, "%s(level=%d): Zone allocated, zoneid=%ld, current_active_zones=%d",
+                 zonefile->GetFilename().c_str(),
+                 LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
+                 z->GetZoneId(),
+                 zbd_->active_zones_.load());
 
   zonefile->PushExtent(new ZoneExtent(z->extent_start_, aligned, z));
   z->extent_start_ = z->wp_ + aligned;
@@ -913,6 +970,8 @@ static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
                          size_t file_advance, size_t leftover_tail) {
   IOStatus s;
+
+  assert(zone->zbd_->BusyZone(zone));
 
   s = zone->Append(data, size);
   if (!s.ok()) {
@@ -932,7 +991,7 @@ static void BGWorkAppend(char *data, size_t size,
                    zone->zbd_->zone_tokens_.unsafe_size());
   } else {
     zone->zbd_->PutZone(zone);
-    zone->zbd_->partial_zones_.push(zone);
+    zone->zbd_->partial_zones_[zone->level_]->push(zone);
   }
 }
 
