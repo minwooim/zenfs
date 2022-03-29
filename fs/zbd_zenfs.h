@@ -36,7 +36,7 @@
 
 #define ZSG_NR_ZONES      (40704)
 // Size of a buffer for a zone striping group
-#define ZSG_ZONE_SIZE     (1ULL * 1024 * 1024)
+#define ZSG_ZONE_SIZE     (32ULL * 1024 * 1024)
 // Actual size of a SSTable
 #define ZSG_START_ZONE    (16)
 #define ZSG_MAX_ACTIVE_ZONES  (256)
@@ -274,11 +274,8 @@ class ZonedBlockDevice {
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 
-  bool GetZone(Zone* z);
-  void PutZone(Zone* z);
-  bool BusyZone(Zone* z);
-
-  bool AllocateZSGZone(Zone*& zone, Env::WriteLifeTimeHint lifetime);
+  bool AllocateZSGZone(Zone*& zone, ZoneFile* zonefile);
+  bool GetPartialZone(Zone*& zone, ZoneFile* zonefile);
   bool GetPartialZone(Zone*& zone, int level);
   bool GetFreeZoneFromSpare(Zone*& zone, int from_level);
   bool GetFreeZone(Zone*& zone, int level);
@@ -288,7 +285,6 @@ class ZonedBlockDevice {
   IOStatus GetZoneDeferredStatus();
 
  public:
-  std::vector<size_t> level_sizes_;
   std::atomic<int> active_zones_;
   tbb::concurrent_queue<bool> zone_tokens_;
   std::vector<tbb::concurrent_queue<Zone*>*> free_zones_;
