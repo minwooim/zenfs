@@ -70,7 +70,7 @@ class ZoneFile {
   IOStatus CloseWR();
   bool IsOpenForWR();
 
-  void Append(void *data, int data_size, IODebugContext* dbg);
+  void Append(void *data, size_t data_size, IODebugContext* dbg);
 
   ZoneStripingGroup *zsg_;
   inline bool InZSG() {
@@ -128,6 +128,7 @@ class ZoneFile {
 
  public:
   bool deleted_;
+  IODebugContext* dbg_;
 };
 
 class ZonedWritableFile : public FSWritableFile {

@@ -210,7 +210,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
 
         zsg_ = nullptr;
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
-
+        dbg_ = nullptr;
       }
 
 std::string ZoneFile::GetFilename() { return filename_; }
@@ -501,7 +501,7 @@ void ZoneFile::PushExtent() {
 		  active_zone_->used_capacity_.load());
 }
 
-void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
+void ZoneFile::Append(void *data, size_t data_size, IODebugContext* dbg) {
   if (!zsg_) {
     zsg_ = new ZoneStripingGroup(zbd_);
   }

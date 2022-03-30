@@ -36,16 +36,13 @@
 
 #define ZSG_NR_ZONES      (40704)
 // Size of a buffer for a zone striping group
-#define ZSG_ZONE_SIZE     (1ULL * 1024 * 1024)
+#define ZSG_WRITE_BUFFER_SIZE (3ULL * 1024 * 1024 * 1024)
+#define ZSG_ZONE_SIZE     (static_cast<size_t>(96ULL * 1024 * 1024))
 // Actual size of a SSTable
 #define ZSG_START_ZONE    (16)
 #define ZSG_MAX_ACTIVE_ZONES  (256)
 // Column family options. We just give hard-coded value along with db_bench
 #define ZSG_NR_LEVELS     (5) // default: 7
-#define ZSG_LEVEL_BASE    (4ULL * 1024 * 1024 * 1024) // default: 256MB
-#define ZSG_LEVEL_MUL     (4) // default: 10
-#define ZSG_WRITE_BUFFER_SIZE (2ULL * 1024 * 1024 * 1024) // default: 64MB
-#define ZSG_COMPACTION_TRIGGER  (4) // default: 4
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -274,12 +271,7 @@ class ZonedBlockDevice {
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 
-  bool GetZone(Zone* z);
-  void PutZone(Zone* z);
-  bool BusyZone(Zone* z);
-
   bool AllocateZSGZone(Zone*& zone, Env::WriteLifeTimeHint lifetime);
-  bool GetPartialZone(Zone*& zone, int level);
   bool GetFreeZoneFromSpare(Zone*& zone, int from_level);
   bool GetFreeZone(Zone*& zone, int level);
 
@@ -288,7 +280,6 @@ class ZonedBlockDevice {
   IOStatus GetZoneDeferredStatus();
 
  public:
-  std::vector<size_t> level_sizes_;
   std::atomic<int> active_zones_;
   tbb::concurrent_queue<bool> zone_tokens_;
   std::vector<tbb::concurrent_queue<Zone*>*> free_zones_;
