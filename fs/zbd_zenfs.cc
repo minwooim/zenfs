@@ -848,69 +848,118 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone,
   return true;
 }
 
-static void BGWorkAppend(char *data, size_t size, Zone *zone);
+static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
+                         size_t chunk_size, int nr_zones, size_t size);
 
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
-  const size_t block_size = zbd_->GetBlockSize();
-  size_t left = size;
   char *_data = (char *) data;
+  int nr_zones = std::ceil(static_cast<float>(size) / static_cast<float>(ZSG_ZONE_SIZE));
 
-  ROCKS_LOG_INFO(_logger, "%s(level=%d): Append size=0x%lx (%p == %p)\n",
+  ROCKS_LOG_INFO(_logger, "%s(level=%d): Append size=0x%lx, nr_zones=%d (%p == %p)\n",
            zonefile->GetFilename().c_str(),
            LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
-           size,
+           size, nr_zones,
            static_cast<AlignedBuffer*>(dbg->buf_)->BufferStart(),
            data);
 
-  zonefile->dbg_ = dbg;
-
-  while (left) {
-    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
-    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
-    Zone* z;
-
-    while (!zbd_->AllocateZSGZone(z, zonefile->GetWriteLifeTimeHint()));
-    ROCKS_LOG_INFO(_logger, "%s(level=%d): Zone allocated, zoneid=%ld, current_active_zones=%d, each=%ld, aligned=%ld\n",
-                   zonefile->GetFilename().c_str(),
-                   LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
-                   z->GetZoneId(),
-                   zbd_->active_zones_.load(), each, aligned);
-
-    zonefile->PushExtent(new ZoneExtent(z->extent_start_, aligned, z));
-    z->extent_start_ = z->wp_ + aligned;
-    z->used_capacity_ += aligned;
-    thread_pool_.push_back(std::thread(BGWorkAppend, _data, aligned, z));
-
-    _data += aligned;
-    left -= aligned;
-  }
-}
-
-static void BGWorkAppend(char *data, size_t size, Zone *zone) {
-  IOStatus s;
-
-  s = zone->Append(data, size);
-  if (!s.ok()) {
-    printf("pwrite() failed, zone=%ld\n", zone->GetZoneId());
+  // This branch supports only for single append shot for whole bunch of the
+  // file buffer (e.g., 2GB).
+  if (zonefile->dbg_) {
+    printf("%s(level=%d): double appended attempted!\n",
+           zonefile->GetFilename().c_str(),
+           LifetimeToLevel(zonefile->GetWriteLifeTimeHint()));
     abort();
   }
 
-  zone->Finish();
-  zone->zbd_->active_zones_--;
-  zone->zbd_->zone_tokens_.push(true);
-  ROCKS_LOG_INFO(_logger, "active: Zone finished, active_zones_=%d, tokens=%ld",
-                 zone->zbd_->active_zones_.load(),
-                 zone->zbd_->zone_tokens_.unsafe_size());
-}
+  zonefile->dbg_ = dbg;
 
-void ZoneStripingGroup::Fsync(ZoneFile* zonefile) {
+  int nr_extents = std::ceil(static_cast<float>(size) / static_cast<float>(ZSG_CHUNK_SIZE));
+  zonefile->ReserveExtents(nr_extents);
+
+  // Allocate zones for nr_zones first
+  Zone* z;
+  const size_t chunk_size = ZSG_CHUNK_SIZE;
+
+  for (int i = 0; i < nr_zones; i++) {
+    while (!zbd_->AllocateZSGZone(z, zonefile->GetWriteLifeTimeHint()));
+    ROCKS_LOG_INFO(_logger, "%s(level=%d): Zone allocated, zoneid=%ld, current_active_zones=%d\n",
+                   zonefile->GetFilename().c_str(),
+                   LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
+                   z->GetZoneId(),
+                   zbd_->active_zones_.load());
+
+    thread_pool_.push_back(std::thread(BGWorkAppend, _data, zonefile, i, z,
+                                       chunk_size, nr_zones, size));
+  }
+
   for (auto& thread : thread_pool_) {
     thread.join();
   }
   thread_pool_.clear();
 
+  ROCKS_LOG_INFO(_logger, "%s(level=%d): finished, filesize=%ld\n",
+                 zonefile->GetFilename().c_str(),
+                 LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
+                 size);
+
+}
+
+static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
+                         size_t chunk_size, int nr_zones, size_t size) {
+  const size_t block_size = zonefile->GetZbd()->GetBlockSize();
+  uint64_t buf_first_offset = zoneid * chunk_size;
+  uint64_t buf_cur_offset = buf_first_offset;
+  uint64_t skip = chunk_size * nr_zones;
+  int idx = zoneid;  // extent index starts with zoneid
+  int _i = 0;
+
+  if (buf_first_offset >= size) {
+    printf("BGWorkAppend: buf_first_offset=0x%lx >= size=0x%lx (zoneid=%d, chunk_size=%ld)\n",
+           buf_first_offset, size, zoneid, chunk_size);
+    abort();
+  }
+
+  IOStatus s;
+  while (buf_cur_offset < size) {
+    size_t each = (buf_cur_offset + chunk_size >= size) ?
+                    size - buf_cur_offset : chunk_size;
+    size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
+
+    // extents list should not be concurrent list or array because each threads
+    // will put its own extent to a specified position of array index.
+    ROCKS_LOG_INFO(_logger, "%s(level=%d): [%d] zoneid=%ld, extent_idx=%d(%d), each=%ld, aligned=%ld\n",
+                   zonefile->GetFilename().c_str(),
+                   LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
+                   zoneid, zone->GetZoneId(), idx, _i++, each, aligned);
+    zonefile->PushExtent(new ZoneExtent(zone->extent_start_, aligned, zone),
+                         idx);
+    zone->extent_start_ = zone->wp_ + aligned;
+    zone->used_capacity_ += aligned;
+
+    s = zone->Append(data + buf_cur_offset, aligned);
+    if (!s.ok()) {
+      printf("pwrite() failed, zone=%ld\n", zone->GetZoneId());
+      abort();
+    }
+
+    buf_cur_offset += skip;
+    idx += nr_zones;
+    zonefile->filesize_ += aligned;
+  }
+
+  zone->Finish();
+  zone->zbd_->active_zones_--;
+  zone->zbd_->zone_tokens_.push(true);
+  ROCKS_LOG_INFO(_logger, "active: Zone finished, active_zones_=%d, tokens=%ld, filesize=%ld\n",
+                 zone->zbd_->active_zones_.load(),
+                 zone->zbd_->zone_tokens_.unsafe_size(), zonefile->filesize_.load());
+}
+
+void ZoneStripingGroup::Fsync(ZoneFile* zonefile) {
   if (zonefile->dbg_) {
+    zonefile->UpdateExtents();
+
     delete static_cast<AlignedBuffer*>(zonefile->dbg_->buf_)->Release();
     ROCKS_LOG_INFO(_logger, "%s(level=%d): Release buffer\n",
              zonefile->GetFilename().c_str(),

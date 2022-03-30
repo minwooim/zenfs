@@ -43,6 +43,7 @@ class ZoneFile {
  protected:
   ZonedBlockDevice* zbd_;
   std::vector<ZoneExtent*> extents_;
+  std::vector<ZoneExtent*> extents_vec_;
   Zone* active_zone_;
   uint64_t extent_start_;
   uint64_t extent_filepos_;
@@ -100,8 +101,18 @@ class ZoneFile {
                           char* scratch, bool direct);
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
   void PushExtent();
-  inline void PushExtent(ZoneExtent *extent) {
-    extents_.push_back(extent);
+  inline void PushExtent(ZoneExtent *extent, int idx) {
+    extents_vec_[idx] = extent;
+  }
+
+  inline void ReserveExtents(int nr_extents) {
+    extents_vec_.reserve(nr_extents);
+  }
+
+  inline void UpdateExtents() {
+    for (uint32_t i = 0; i < extents_vec_.capacity(); i++) {
+      extents_.push_back(extents_vec_[i]);
+    }
   }
 
   void EncodeTo(std::string* output, uint32_t extent_start);
@@ -129,6 +140,7 @@ class ZoneFile {
  public:
   bool deleted_;
   IODebugContext* dbg_;
+  std::atomic<size_t> filesize_;
 };
 
 class ZonedWritableFile : public FSWritableFile {
