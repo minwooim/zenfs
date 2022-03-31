@@ -36,7 +36,7 @@
 
 #define ZSG_NR_ZONES      (40704)
 // Size of a buffer for a zone striping group
-#define ZSG_ZONE_SIZE     (32ULL * 1024 * 1024)
+#define ZSG_ZONE_SIZE     (1ULL * 1024 * 1024)
 // Actual size of a SSTable
 #define ZSG_START_ZONE    (16)
 #define ZSG_MAX_ACTIVE_ZONES  (256)
