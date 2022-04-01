@@ -69,6 +69,7 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
 
   extent_start_ = start_;
   id_ = start_ / zbd_zone_len(z);
+  level_ = ZSG_NR_LEVELS;
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -123,7 +124,7 @@ IOStatus Zone::Reset() {
   extent_start_ = start_;
 
   if (GetZoneId() >= ZSG_START_ZONE) {
-    zbd_->free_zones_[level_]->push(this);
+    zbd_->free_zones_[ZSG_NR_LEVELS]->push(this);
   }
 
   finished_ = false;
