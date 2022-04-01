@@ -135,9 +135,6 @@ IOStatus Zone::Reset() {
                      zbd_->zone_tokens_.unsafe_size());
     }
 
-    if (zbd_->BusyZone(this)) {
-      zbd_->PutZone(this);
-    }
     zbd_->free_zones_.push(this);
   }
 
@@ -235,7 +232,6 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
 
   active_zones_ = 0;
-  CK_BITMAP_INIT(&zone_bitmap_, ZSG_NR_ZONES, 0);
   for (int i = 0; i < ZSG_MAX_ACTIVE_ZONES; i++) {
     zone_tokens_.push(true);
   }
@@ -809,31 +805,9 @@ void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto &zone : io_zones) snapshot.emplace_back(*zone);
 }
 
-bool ZonedBlockDevice::GetZone(Zone* z) {
-  if (CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId())) {
-    return false;
-  }
-
-  return !CK_BITMAP_BTS(&zone_bitmap_, z->GetZoneId());
-}
-
-void ZonedBlockDevice::PutZone(Zone* z) {
-  assert(CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId()));
-  CK_BITMAP_RESET(&zone_bitmap_, z->GetZoneId());
-}
-
-bool ZonedBlockDevice::BusyZone(Zone* z) {
-  return CK_BITMAP_TEST(&zone_bitmap_, z->GetZoneId());
-}
-
 bool ZonedBlockDevice::GetPartialZone(Zone*& zone) {
   if (partial_zones_.try_pop(zone)) {
-    if (GetZone(zone)) {
-      return true;
-    } else {
-      printf("ZonedBlockDevice::GetPartialZone(): failed to get zone (1)\n");
-      abort();
-    }
+    return true;
   }
 
   return false;
@@ -841,13 +815,8 @@ bool ZonedBlockDevice::GetPartialZone(Zone*& zone) {
 
 bool ZonedBlockDevice::GetFreeZone(Zone*& zone) {
   if (free_zones_.try_pop(zone)) {
-    if (GetZone(zone)) {
-      active_zones_++;
-      return true;
-    } else {
-      printf("ZonedBlockDevice::GetPartialZone(): failed to get zone (1)\n");
-      abort();
-    }
+    active_zones_++;
+    return true;
   }
 
   return false;
@@ -931,7 +900,6 @@ static void BGWorkAppend(char *data, size_t size,
                    zone->zbd_->active_zones_.load(),
                    zone->zbd_->zone_tokens_.unsafe_size());
   } else {
-    zone->zbd_->PutZone(zone);
     zone->zbd_->partial_zones_.push(zone);
   }
 }

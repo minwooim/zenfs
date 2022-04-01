@@ -32,7 +32,6 @@
 // We should include port/port_posix.h for compatibiltiy, but we don't include
 // port/ directory in this header file.
 #include <thread>
-#include <ck_bitmap.h>
 
 #define ZSG_NR_ZONES      (40704)
 // Size of a buffer for a zone striping group
@@ -284,7 +283,6 @@ class ZonedBlockDevice {
   tbb::concurrent_queue<bool> zone_tokens_;
   tbb::concurrent_queue<Zone*> free_zones_;
   tbb::concurrent_queue<Zone*> partial_zones_;
-  CK_BITMAP_INSTANCE(ZSG_NR_ZONES) zone_bitmap_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE
