@@ -838,7 +838,7 @@ IOStatus ZonedRandomAccessFile::Read(uint64_t offset, size_t n,
                                      const IOOptions& /*options*/,
                                      Slice* result, char* scratch,
                                      IODebugContext* dbg) const {
-  if (dbg && dbg->for_compaction_) {
+  if ((dbg && dbg->for_compaction_) || n > ZSG_ZONE_SIZE) {
     return zoneFile_->ConcurrentRead(offset, n, result, scratch, direct_);
   }
 
