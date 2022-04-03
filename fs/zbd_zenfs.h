@@ -270,7 +270,7 @@ class ZonedBlockDevice {
   void PutZone(Zone* z);
   bool BusyZone(Zone* z);
 
-  bool AllocateZSGZone(Zone*& zone);
+  bool AllocateZSGZone(ZoneFile* zonefile, Zone*& zone);
   bool GetPartialZone(Zone*& zone);
   bool GetFreeZone(Zone*& zone);
 

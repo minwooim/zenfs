@@ -20,6 +20,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <ck_bitmap.h>
 
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
@@ -128,6 +129,7 @@ class ZoneFile {
 
  public:
   bool deleted_;
+  CK_BITMAP_INSTANCE(ZSG_NR_ZONES) zones_;
 };
 
 class ZonedWritableFile : public FSWritableFile {

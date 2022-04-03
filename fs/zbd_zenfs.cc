@@ -822,10 +822,11 @@ bool ZonedBlockDevice::GetFreeZone(Zone*& zone) {
   return false;
 }
 
-bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
+bool ZonedBlockDevice::AllocateZSGZone(ZoneFile* zonefile, Zone*& zone) {
   bool token;
 
   if (GetPartialZone(zone)) {
+    CK_BITMAP_SET(&zonefile->zones_, zone->GetZoneId());
     return true;
   }
 
@@ -833,6 +834,7 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
     if (!GetPartialZone(zone)) {
       return false;
     } else {
+      CK_BITMAP_SET(&zonefile->zones_, zone->GetZoneId());
       return true;
     }
   }
@@ -842,6 +844,7 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
     return false;
   }
 
+  CK_BITMAP_SET(&zonefile->zones_, zone->GetZoneId());
   ROCKS_LOG_INFO(_logger, "active: Free zone allocated, active_zones_=%d, tokens=%ld",
                  active_zones_.load(), zone_tokens_.unsafe_size());
   return true;
@@ -859,7 +862,7 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
   char *_data = (char *) data;
   Zone* z;
 
-  while (!zbd_->AllocateZSGZone(z)) {
+  while (!zbd_->AllocateZSGZone(zonefile, z)) {
     ROCKS_LOG_INFO(_logger, "%s: Waiting for zone allocation.. partial=%ld, free=%ld, tokens=%ld",
                    zonefile->GetFilename().c_str(),
                    zbd_->partial_zones_.unsafe_size(),
@@ -904,7 +907,7 @@ static void BGWorkAppend(char *data, size_t size,
   }
 }
 
-void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
+void ZoneStripingGroup::Fsync(ZoneFile* zonefile) {
   if (GetState() == ZSGState::kFull) {
     return;
   }
@@ -913,6 +916,10 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
     thread.join();
   }
   thread_pool_.clear();
+
+  ROCKS_LOG_INFO(_logger, "%s: allocated_zones=%d\n",
+                 zonefile->GetFilename().c_str(),
+                 CK_BITMAP_COUNT(&zonefile->zones_, ZSG_NR_ZONES));
 
   SetState(ZSGState::kFull);
 }

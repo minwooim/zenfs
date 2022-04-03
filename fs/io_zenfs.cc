@@ -209,6 +209,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
       deleted_(false) {
 
         zsg_ = nullptr;
+        CK_BITMAP_INIT(&zones_, ZSG_NR_ZONES, 0);
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
 
       }
