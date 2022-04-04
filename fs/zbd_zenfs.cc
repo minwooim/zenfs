@@ -888,11 +888,6 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
   }
   thread_pool_.clear();
 
-  for (int i = 0; i < nr_zones_; i++) {
-    Zone *zone = zones_[i];
-    zone->Finish();
-  }
-
   SetState(ZSGState::kFull);
 }
 
