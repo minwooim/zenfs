@@ -128,6 +128,7 @@ class ZoneFile {
 
  public:
   bool deleted_;
+  bool in_progress_;
 };
 
 class ZonedWritableFile : public FSWritableFile {

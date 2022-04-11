@@ -210,6 +210,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
 
         zsg_ = nullptr;
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
+        in_progress_ = false;
 
       }
 
@@ -529,8 +530,11 @@ void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
         filename_.c_str(), zsg_->GetId());
   }
 
-  bool token;
-  while (!zbd_->zone_tokens_.try_pop(token));
+  if (!in_progress_) {
+    bool token;
+    while (!zbd_->zone_tokens_.try_pop(token));
+    in_progress_ = true;
+  }
 
   zsg_->Append(this, data, data_size, dbg);
   fileSize += data_size;
