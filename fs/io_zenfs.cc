@@ -529,6 +529,9 @@ void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
         filename_.c_str(), zsg_->GetId());
   }
 
+  bool token;
+  while (!zbd_->zone_tokens_.try_pop(token));
+
   zsg_->Append(this, data, data_size, dbg);
   fileSize += data_size;
 }

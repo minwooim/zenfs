@@ -41,6 +41,7 @@
 #define ZSG_FILES         (1)
 // Actual size of a SSTable
 #define ZSG_START_ZONE    (ZSG_ZONES * 5)
+#define ZSG_MAX_ACTIVE_ZONES (256)
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -337,6 +338,7 @@ class ZonedBlockDevice {
   std::mutex zsgq_push_mtx_;
   std::mutex zsgpq_push_mtx_;
   std::mutex zsgq_pop_mtx_;
+  tbb::concurrent_queue<bool> zone_tokens_;
 
  private:
   std::string ErrorToString(int err);

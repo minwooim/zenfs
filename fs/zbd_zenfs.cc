@@ -215,6 +215,10 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
                                    std::shared_ptr<ZenFSMetrics> metrics)
     : filename_("/dev/" + bdevname), logger_(logger), metrics_(metrics) {
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
+
+  for (int i = 0; i < ZSG_MAX_ACTIVE_ZONES / ZSG_ZONES; i++) {
+    zone_tokens_.push(true);
+  }
 }
 
 std::string ZonedBlockDevice::ErrorToString(int err) {
@@ -895,6 +899,8 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
   }
 
   SetState(ZSGState::kFull);
+
+  zbd_->zone_tokens_.push(true);
 }
 
 void ZoneStripingGroup::PushExtents(ZoneFile *zonefile) {
