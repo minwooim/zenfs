@@ -71,6 +71,7 @@ Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
 
   extent_start_ = start_;
   id_ = start_ / zbd_zone_len(z);
+  in_progress_ = false;
 }
 
 bool Zone::IsUsed() { return (used_capacity_ > 0); }
@@ -124,6 +125,7 @@ IOStatus Zone::Reset() {
   wp_before_finish_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
   extent_start_ = start_;
+  in_progress_ = false;
 
   return IOStatus::OK();
 }
@@ -216,7 +218,7 @@ ZonedBlockDevice::ZonedBlockDevice(std::string bdevname,
     : filename_("/dev/" + bdevname), logger_(logger), metrics_(metrics) {
   Info(logger_, "New Zoned Block Device: %s", filename_.c_str());
 
-  for (int i = 0; i < ZSG_MAX_ACTIVE_ZONES / ZSG_ZONES; i++) {
+  for (int i = 0; i < ZSG_MAX_ACTIVE_ZONES; i++) {
     zone_tokens_.push(true);
   }
 }
@@ -834,6 +836,13 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
     while (CK_BITMAP_TEST(&used_bitmap_, current_zone_));
     CK_BITMAP_SET(&used_bitmap_, current_zone_);
 
+    if (!z->in_progress_) {
+      bool token;
+      while (zbd_->zone_tokens_.try_pop(token));
+
+      z->in_progress_ = true;
+    }
+
     ROCKS_LOG_INFO(_logger, "%s: zsg %d, zone %ld, offset=0x%lx, size=0x%lx",
         zonefile->GetFilename().c_str(), id_, z->GetZoneId(),
         z->extent_start_, aligned);
@@ -897,12 +906,11 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
     Zone *zone = zones_[i];
     if (!zone->IsEmpty()) {
       zone->Finish();
+      zbd_->zone_tokens_.push(true);
     }
   }
 
   SetState(ZSGState::kFull);
-
-  zbd_->zone_tokens_.push(true);
 }
 
 void ZoneStripingGroup::PushExtents(ZoneFile *zonefile) {

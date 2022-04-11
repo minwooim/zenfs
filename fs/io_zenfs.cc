@@ -210,8 +210,6 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
 
         zsg_ = nullptr;
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
-        in_progress_ = false;
-
       }
 
 std::string ZoneFile::GetFilename() { return filename_; }
@@ -528,12 +526,6 @@ void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
     zsg_ = zbd_->AllocateZoneStripingGroup();
     ROCKS_LOG_INFO(_logger, "%s zone striping group %ld allocated",
         filename_.c_str(), zsg_->GetId());
-  }
-
-  if (!in_progress_) {
-    bool token;
-    while (!zbd_->zone_tokens_.try_pop(token));
-    in_progress_ = true;
   }
 
   zsg_->Append(this, data, data_size, dbg);

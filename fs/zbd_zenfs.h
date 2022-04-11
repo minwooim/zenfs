@@ -112,6 +112,7 @@ class Zone {
   }
 
   uint64_t wp_before_finish_;
+  bool in_progress_;
 };
 
 enum class ZSGState {
