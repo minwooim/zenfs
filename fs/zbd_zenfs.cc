@@ -854,7 +854,8 @@ static void BGWorkAppend(char *data, size_t size,
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
   const size_t block_size = zbd_->GetBlockSize();
-  size_t each = (size < ZSG_ZONE_SIZE) ? size : ZSG_ZONE_SIZE;
+  AlignedBuffer* _buf = static_cast<AlignedBuffer*>(dbg->buf_);
+  size_t each = (size < _buf->Capacity()) ? size : _buf->Capacity();
   size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
   char *_data = (char *) data;
   Zone* z;
@@ -882,6 +883,7 @@ static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
                          size_t file_advance, size_t leftover_tail) {
   IOStatus s;
+  size_t bufsize = buf->Capacity();
 
   s = zone->Append(data, size);
   if (!s.ok()) {
@@ -892,7 +894,7 @@ static void BGWorkAppend(char *data, size_t size,
   buf->RefitTail(file_advance, leftover_tail);
   delete buf->Release();
 
-  if (zone->capacity_ < ZSG_ZONE_SIZE) {
+  if (zone->capacity_ < bufsize) {
     zone->Finish();
     zone->zbd_->active_zones_--;
     zone->zbd_->zone_tokens_.push(true);
