@@ -895,7 +895,9 @@ void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
 
   for (int i = 0; i < nr_zones_; i++) {
     Zone *zone = zones_[i];
-    zone->Finish();
+    if (!zone->IsEmpty()) {
+      zone->Finish();
+    }
   }
 
   SetState(ZSGState::kFull);
