@@ -819,10 +819,11 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
   const size_t block_size = zbd_->GetBlockSize();
   char *_data = (char *) data;
   size_t left = size;
+  AlignedBuffer* _buf = static_cast<AlignedBuffer*>(dbg->buf_);
 
   while (left) {
     assert(current_zone_ < ZSG_ZONES);
-    size_t each = (left < ZSG_ZONE_SIZE) ? left : ZSG_ZONE_SIZE;
+    size_t each = (left < _buf->Capacity()) ? left : _buf->Capacity();
     size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
     Zone *z = zones_[current_zone_];
 
@@ -867,7 +868,7 @@ static void BGWorkAppend(ZoneStripingGroup *zsg, char *data, size_t size,
   buf->RefitTail(file_advance, leftover_tail);
   delete buf->Release();
 
-  if (zone->capacity_ < ZSG_ZONE_SIZE) {
+  if (zone->capacity_ < buf->Capacity()) {
     ROCKS_LOG_INFO(_logger, "zsg %d, zone %ld, finish",
         zsg->id_, zone->GetZoneId());
     zone->Finish();
