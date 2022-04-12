@@ -929,7 +929,7 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone, ZoneFile* zonefile) {
     return false;
   }
 
-  if (zonefile->nr_zones_ < 22) {
+  if (zonefile->nr_zones_ < 11) {
     if (!GetFreeZone(zone, level)) {
       zone_tokens_.push(token);
       return false;
