@@ -211,6 +211,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
         zsg_ = nullptr;
         nr_zones_ = 0;
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
+        buflen_ = 0;
 
       }
 

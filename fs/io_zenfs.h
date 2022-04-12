@@ -134,6 +134,8 @@ class ZoneFile {
   inline int Level() {
     return LifetimeToLevel(lifetime_);
   }
+
+  size_t buflen_;
 };
 
 class ZonedWritableFile : public FSWritableFile {
