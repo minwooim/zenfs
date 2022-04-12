@@ -953,13 +953,14 @@ static void BGWorkAppend(char *data, size_t size,
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
   const size_t block_size = zbd_->GetBlockSize();
-  size_t each = (size < ZSG_ZONE_SIZE) ? size : ZSG_ZONE_SIZE;
+  AlignedBuffer* _buf = static_cast<AlignedBuffer*>(dbg->buf_);
+  size_t each = (size < _buf->Capacity()) ? size : _buf->Capacity();
   size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
   char *_data = (char *) data;
   Zone* z;
 
   while (!zbd_->AllocateZSGZone(z, zonefile)) {
-    ;
+    std::this_thread::yield();
   }
   assert(zbd_->BusyZone(z));
   ROCKS_LOG_INFO(_logger, "%s(level=%d): Zone allocated, zoneid=%ld, current_active_zones=%d",
@@ -981,6 +982,7 @@ static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, ZoneFile* zonefile, AlignedBuffer *buf,
                          size_t file_advance, size_t leftover_tail) {
   IOStatus s;
+  size_t buflen = buf->Capacity();
 
   assert(zone->zbd_->BusyZone(zone));
 
@@ -993,7 +995,7 @@ static void BGWorkAppend(char *data, size_t size,
   buf->RefitTail(file_advance, leftover_tail);
   delete buf->Release();
 
-  if (zone->capacity_ < ZSG_ZONE_SIZE) {
+  if (zone->capacity_ < buflen) {
     zone->Finish();
     zone->zbd_->active_zones_--;
     zone->zbd_->zone_tokens_.push(true);
