@@ -213,6 +213,13 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
         buflen_ = 0;
 
+        // For WAL redirection
+        //
+        if (filename_.substr(filename_.size() - 3) == "log") {
+          wal_path_ = "/tmp/rocksdb/" + filename_;
+          wal_fd_ = open(wal_path_.c_str(), O_WRONLY | O_CREAT | O_DIRECT, 0644);
+        }
+
       }
 
 std::string ZoneFile::GetFilename() { return filename_; }
@@ -246,6 +253,11 @@ ZoneFile::~ZoneFile() {
   IOStatus s = CloseWR();
   if (!s.ok()) {
     zbd_->SetZoneDeferredStatus(s);
+  }
+
+  if (filename_.substr(filename_.size() - 3) == "log") {
+    close(wal_fd_);
+    remove(wal_path_.c_str());
   }
 }
 
@@ -512,11 +524,25 @@ void ZoneFile::Append(void *data, int data_size, IODebugContext* dbg) {
   fileSize += data_size;
 }
 
+IOStatus ZoneFile::RedirectWAL(void* data, int data_size) {
+  int ret;
+
+  ret = write(wal_fd_, data, data_size);
+  if (ret < 0) {
+    abort();
+  }
+  return IOStatus::OK();
+}
+
 /* Assumes that data and size are block aligned */
 IOStatus ZoneFile::Append(void* data, int data_size, int valid_size) {
   uint32_t left = data_size;
   uint32_t wr_size, offset = 0;
   IOStatus s = IOStatus::OK();
+
+  if (filename_.substr(filename_.size() - 3) == "log") {
+    return RedirectWAL(data, data_size);
+  }
 
   if (!active_zone_) {
     Zone* zone = nullptr;

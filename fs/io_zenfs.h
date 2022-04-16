@@ -136,6 +136,11 @@ class ZoneFile {
   }
 
   size_t buflen_;
+
+  // for WAL redirection
+  IOStatus RedirectWAL(void* data, int data_size);
+  std::string wal_path_;
+  int wal_fd_;
 };
 
 class ZonedWritableFile : public FSWritableFile {
