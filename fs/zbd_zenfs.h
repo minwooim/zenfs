@@ -75,7 +75,7 @@ class Zone {
   IOStatus Finish();
   IOStatus Close();
 
-  IOStatus Append(char *data, uint32_t size);
+  IOStatus Append(char *data, uint32_t size, uint64_t* t=nullptr);
   bool IsUsed();
   bool IsFull();
   bool IsEmpty();

@@ -141,6 +141,7 @@ class ZoneFile {
   bool deleted_;
   IODebugContext* dbg_;
   std::atomic<size_t> filesize_;
+  std::atomic<uint64_t> wr_us;
 };
 
 class ZonedWritableFile : public FSWritableFile {

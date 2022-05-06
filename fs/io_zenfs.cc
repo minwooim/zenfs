@@ -211,6 +211,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
         zsg_ = nullptr;
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
         dbg_ = nullptr;
+        wr_us = 0;
       }
 
 std::string ZoneFile::GetFilename() { return filename_; }
@@ -506,8 +507,8 @@ void ZoneFile::Append(void *data, size_t data_size, IODebugContext* dbg) {
     zsg_ = new ZoneStripingGroup(zbd_);
   }
 
-  zsg_->Append(this, data, data_size, dbg);
   fileSize += data_size;
+  zsg_->Append(this, data, data_size, dbg);
 }
 
 /* Assumes that data and size are block aligned */

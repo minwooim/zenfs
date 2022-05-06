@@ -36,6 +36,7 @@
 #include "snapshot.h"
 #include "logging/logging.h"
 #include "util/aligned_buffer.h"
+#include "rocksdb/system_clock.h"
 
 #define KB (1024)
 #define MB (1024 * KB)
@@ -53,6 +54,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 extern std::shared_ptr<Logger> _logger;
+extern std::shared_ptr<rocksdb::Logger> _info_log;
 
 Zone::Zone(ZonedBlockDevice *zbd, struct zbd_zone *z)
     : zbd_(zbd),
@@ -166,13 +168,15 @@ IOStatus Zone::Close() {
   return IOStatus::OK();
 }
 
-IOStatus Zone::Append(char *data, uint32_t size) {
+IOStatus Zone::Append(char *data, uint32_t size, uint64_t* t) {
   char *ptr = data;
   uint32_t left = size;
   int fd = zbd_->GetWriteFD();
   int ret;
   // NOWS: Namespace Optimal Write Size
   uint32_t unit = 128 * KB;
+  const auto clock = SystemClock::Default().get();
+  uint64_t s, e, _t = 0;
 
   if (capacity_ < size) {
     ROCKS_LOG_ERROR(_logger, "zone append failed. zone %ld capacity full, cap=%ld, size=%u",
@@ -184,12 +188,16 @@ IOStatus Zone::Append(char *data, uint32_t size) {
 
   while (left) {
     unit = (unit > left) ? left : unit;
+    s = clock->NowMicros();
     ret = pwrite(fd, ptr, unit, wp_);
+    e = clock->NowMicros();
     if (ret < 0) {
       abort();
       return IOStatus::IOError("Write failed");
     }
     assert(ret == (int) unit);
+
+    _t += e - s;
 
     ptr += ret;
     wp_ += ret;
@@ -198,6 +206,9 @@ IOStatus Zone::Append(char *data, uint32_t size) {
     left -= ret;
   }
 
+  if (t) {
+    *t = _t;
+  }
   return IOStatus::OK();
 }
 
@@ -849,12 +860,14 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone,
 }
 
 static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
-                         size_t chunk_size, int nr_zones, size_t size);
+                         size_t chunk_size, int nr_zones, size_t size,
+                         uint64_t* t);
 
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
   char *_data = (char *) data;
   int nr_zones = std::ceil(static_cast<float>(size) / static_cast<float>(ZSG_ZONE_SIZE));
+  uint64_t* t = new uint64_t[nr_zones];
 
   ROCKS_LOG_INFO(_logger, "%s(level=%d): Append size=0x%lx, nr_zones=%d (%p == %p)\n",
            zonefile->GetFilename().c_str(),
@@ -882,6 +895,8 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
   const size_t chunk_size = ZSG_CHUNK_SIZE;
 
   for (int i = 0; i < nr_zones; i++) {
+    t[i] = 0;
+
     while (!zbd_->AllocateZSGZone(z, zonefile->GetWriteLifeTimeHint()));
     ROCKS_LOG_INFO(_logger, "%s(level=%d): Zone allocated, zoneid=%ld, current_active_zones=%d\n",
                    zonefile->GetFilename().c_str(),
@@ -890,13 +905,37 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                    zbd_->active_zones_.load());
 
     thread_pool_.push_back(std::thread(BGWorkAppend, _data, zonefile, i, z,
-                                       chunk_size, nr_zones, size));
+                                       chunk_size, nr_zones, size, &t[i]));
   }
 
   for (auto& thread : thread_pool_) {
     thread.join();
   }
   thread_pool_.clear();
+
+  // Find out miminum time for I/O threads
+  uint64_t max = 0x0;
+  uint64_t min = 0xffffffffffffffff;
+  for (int i = 0; i < nr_zones; i++) {
+    if (max < t[i]) {
+      max = t[i];
+    }
+  }
+
+  for (int i = 0; i < nr_zones; i++) {
+    if (min > t[i]) {
+      min = t[i];
+    }
+  }
+
+  double mb = zonefile->GetFileSize() / 1024.0f / 1024.0f;
+  double sec_max = max / 1000.0f / 1000.0f;
+  double sec_min = min / 1000.0f / 1000.0f;
+  ROCKS_LOG_INFO(_info_log, "%s(level=%d): number of zones %d, file size %lf MB, write time %lf-%lf s, %lf-%lf MB/s\n",
+           zonefile->GetFilename().c_str(),
+           LifetimeToLevel(zonefile->GetWriteLifeTimeHint()),
+           nr_zones,
+           mb, sec_min, sec_max, mb / sec_max, mb / sec_min);
 
   ROCKS_LOG_INFO(_logger, "%s(level=%d): finished, filesize=%ld\n",
                  zonefile->GetFilename().c_str(),
@@ -906,13 +945,14 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
 }
 
 static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
-                         size_t chunk_size, int nr_zones, size_t size) {
+                         size_t chunk_size, int nr_zones, size_t size, uint64_t* t) {
   const size_t block_size = zonefile->GetZbd()->GetBlockSize();
   uint64_t buf_first_offset = zoneid * chunk_size;
   uint64_t buf_cur_offset = buf_first_offset;
   uint64_t skip = chunk_size * nr_zones;
   int idx = zoneid;  // extent index starts with zoneid
   int _i = 0;
+  uint64_t _t;
 
   if (buf_first_offset >= size) {
     printf("BGWorkAppend: buf_first_offset=0x%lx >= size=0x%lx (zoneid=%d, chunk_size=%ld)\n",
@@ -937,7 +977,7 @@ static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
     zone->extent_start_ = zone->wp_ + aligned;
     zone->used_capacity_ += aligned;
 
-    s = zone->Append(data + buf_cur_offset, aligned);
+    s = zone->Append(data + buf_cur_offset, aligned, &_t);
     if (!s.ok()) {
       printf("pwrite() failed, zone=%ld\n", zone->GetZoneId());
       abort();
@@ -946,6 +986,7 @@ static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
     buf_cur_offset += skip;
     idx += nr_zones;
     zonefile->filesize_ += aligned;
+    *t += _t;
   }
 
   zone->Finish();
@@ -954,6 +995,7 @@ static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
   ROCKS_LOG_INFO(_logger, "active: Zone finished, active_zones_=%d, tokens=%ld, filesize=%ld\n",
                  zone->zbd_->active_zones_.load(),
                  zone->zbd_->zone_tokens_.unsafe_size(), zonefile->filesize_.load());
+  zonefile->wr_us += *t;
 }
 
 void ZoneStripingGroup::Fsync(ZoneFile* zonefile) {
