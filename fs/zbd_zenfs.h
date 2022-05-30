@@ -289,7 +289,10 @@ class ZonedBlockDevice {
 };
 
 inline int LifetimeToLevel(Env::WriteLifeTimeHint lifetime) {
-  assert(lifetime > 0);
+  if (!lifetime) {
+    return 0;
+  }
+
   return lifetime - 1;
 }
 
