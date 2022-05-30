@@ -913,6 +913,9 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
   }
   thread_pool_.clear();
 
+  delete static_cast<AlignedBuffer*>(dbg->buf_)->Release();
+  zonefile->UpdateExtents();
+
   // Find out miminum time for I/O threads
   uint64_t max = 0x0;
   uint64_t min = 0xffffffffffffffff;
@@ -954,12 +957,6 @@ static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
   int _i = 0;
   uint64_t _t;
 
-  if (buf_first_offset >= size) {
-    printf("BGWorkAppend: buf_first_offset=0x%lx >= size=0x%lx (zoneid=%d, chunk_size=%ld)\n",
-           buf_first_offset, size, zoneid, chunk_size);
-    abort();
-  }
-
   IOStatus s;
   while (buf_cur_offset < size) {
     size_t each = (buf_cur_offset + chunk_size >= size) ?
@@ -998,16 +995,8 @@ static void BGWorkAppend(char *data, ZoneFile* zonefile, int zoneid, Zone *zone,
   zonefile->wr_us += *t;
 }
 
-void ZoneStripingGroup::Fsync(ZoneFile* zonefile) {
-  if (zonefile->dbg_) {
-    zonefile->UpdateExtents();
-
-    delete static_cast<AlignedBuffer*>(zonefile->dbg_->buf_)->Release();
-    ROCKS_LOG_INFO(_logger, "%s(level=%d): Release buffer\n",
-             zonefile->GetFilename().c_str(),
-             LifetimeToLevel(zonefile->GetWriteLifeTimeHint()));
-    zonefile->dbg_ = nullptr;
-  }
+void ZoneStripingGroup::Fsync(ZoneFile* /*zonefile*/) {
+  ;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
