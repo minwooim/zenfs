@@ -36,7 +36,7 @@
 
 #define ZSG_NR_ZONES      (40704)
 // Size of a buffer for a zone striping group
-#define ZSG_WRITE_BUFFER_SIZE (3ULL * 1024 * 1024 * 1024)
+#define ZSG_WRITE_BUFFER_SIZE ((1ULL * 1024 * 1024 * 1024) + (128ULL * 1024 * 1024))
 #define ZSG_ZONE_SIZE     (96ULL * 1024 * 1024)
 #define ZSG_CHUNK_SIZE    (1ULL * 1024 * 1024)
 // Actual size of a SSTable
@@ -44,6 +44,8 @@
 #define ZSG_MAX_ACTIVE_ZONES  (256)
 // Column family options. We just give hard-coded value along with db_bench
 #define ZSG_NR_LEVELS     (5) // default: 7
+
+#define ZSG_FAST_LEVEL    (2) // < 2 (e.g., L0, L1)
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -161,6 +163,7 @@ class ZoneStripingGroup {
   }
 
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
+  void AppendChunkSized(ZoneFile *zonefile, void *data, size_t size, IODebugContext *dbg);
   void Append(ZoneFile *zonefile, void *data, size_t size, IODebugContext *dbg);
   void Fsync(ZoneFile *zonefile);
 };
@@ -272,8 +275,11 @@ class ZonedBlockDevice {
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 
+  bool AllocateZSGZoneChunkSized(Zone*& zone, ZoneFile* zonefile);
   bool AllocateZSGZone(Zone*& zone, Env::WriteLifeTimeHint lifetime);
   bool GetFreeZoneFromSpare(Zone*& zone, int from_level);
+  bool GetPartialZone(Zone*& zone, ZoneFile* zonefile);
+  bool GetPartialZone(Zone*& zone, int level);
   bool GetFreeZone(Zone*& zone, int level);
 
  private:

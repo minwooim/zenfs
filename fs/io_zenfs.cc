@@ -212,6 +212,8 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, std::string filename,
         Debug(_logger, "ZoneFile::ZoneFile(): New file, file=%s", filename_.c_str());
         dbg_ = nullptr;
         wr_us = 0;
+        nr_zones_ = 0;
+        buflen_ = 0;
       }
 
 std::string ZoneFile::GetFilename() { return filename_; }

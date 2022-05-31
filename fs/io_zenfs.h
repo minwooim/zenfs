@@ -101,6 +101,11 @@ class ZoneFile {
                           char* scratch, bool direct);
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
   void PushExtent();
+
+  inline void PushExtent(ZoneExtent *extent) {
+    extents_.push_back(extent);
+  }
+
   inline void PushExtent(ZoneExtent *extent, int idx) {
     extents_vec_[idx] = extent;
   }
@@ -138,10 +143,17 @@ class ZoneFile {
   std::shared_ptr<ZenFSMetrics> GetZBDMetrics() { return zbd_->GetMetrics(); }
 
  public:
+  std::atomic<int> nr_zones_;
+  tbb::concurrent_queue<Zone*> zones_;
+  size_t buflen_;
   bool deleted_;
   IODebugContext* dbg_;
   std::atomic<size_t> filesize_;
   std::atomic<uint64_t> wr_us;
+
+  inline int Level() {
+    return LifetimeToLevel(lifetime_);
+  }
 };
 
 class ZonedWritableFile : public FSWritableFile {
