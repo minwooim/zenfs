@@ -670,6 +670,9 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
   /* Try to fill an already open zone(with the best life time diff) */
   for (const auto z : io_zones) {
+    if (z->id_ >= ZSG_START_ZONE) {
+      break;
+    }
     if (z->Acquire()) {
       if ((z->used_capacity_ > 0) && !z->IsFull()) {
         unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
@@ -710,6 +713,9 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
     if (active_io_zones_.load() < max_nr_active_io_zones_) {
       for (const auto z : io_zones) {
+        if (z->id_ >= ZSG_START_ZONE) {
+          break;
+        }
         if (z->Acquire()) {
           if (z->IsEmpty()) {
             z->lifetime_ = file_lifetime;
@@ -805,6 +811,14 @@ void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto &zone : io_zones) snapshot.emplace_back(*zone);
 }
 
+bool ZonedBlockDevice::GetPartialZone(Zone*& zone, ZoneFile* zonefile) {
+  if (zonefile->zones_.try_pop(zone)) {
+    return true;
+  }
+
+  return false;
+}
+
 bool ZonedBlockDevice::GetPartialZone(Zone*& zone) {
   if (partial_zones_.try_pop(zone)) {
     return true;
@@ -820,6 +834,25 @@ bool ZonedBlockDevice::GetFreeZone(Zone*& zone) {
   }
 
   return false;
+}
+
+bool ZonedBlockDevice::AllocateZSGZoneWAL(Zone*& zone, ZoneFile* zonefile) {
+  bool token;
+
+  if (GetPartialZone(zone, zonefile)) {
+    return true;
+  }
+
+  if (!zone_tokens_.try_pop(token)) {
+    return false;
+  }
+
+  if (!GetFreeZone(zone)) {
+    zone_tokens_.push(token);
+    return false;
+  }
+
+  return true;
 }
 
 bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
@@ -847,12 +880,43 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone) {
   return true;
 }
 
+static void BGWorkAppendWAL(char *data, size_t size,
+                         Zone *zone, ZoneFile* zonefile);
 static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, AlignedBuffer *buf,
                          size_t file_advance, size_t leftover_tail);
 
+void ZoneStripingGroup::AppendWAL(ZoneFile *zonefile, void *data, size_t size) {
+  // 128KB * 8zones = 1MB (by default)
+  const int nr_zones = 8;
+  const size_t each = size / nr_zones;
+  Zone* z;
+  char* _data = static_cast<char*>(data);
+
+  for (int i = 0; i < nr_zones; i++) {
+    while (!zbd_->AllocateZSGZoneWAL(z, zonefile));
+
+    zonefile->PushExtent(new ZoneExtent(z->extent_start_, each, z));
+    z->extent_start_ = z->wp_ + each;
+    z->used_capacity_ += each;
+    thread_pool_.push_back(std::thread(BGWorkAppendWAL, _data + i * each,
+                                       each, z, zonefile));
+  }
+
+  for (auto& thread : thread_pool_) {
+    thread.join();
+  }
+  thread_pool_.clear();
+}
+
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
+  if (dbg->for_wal_) {
+    // size = 1MB by default
+    AppendWAL(zonefile, data, size);
+    return;
+  }
+
   const size_t block_size = zbd_->GetBlockSize();
   AlignedBuffer* _buf = static_cast<AlignedBuffer*>(dbg->buf_);
   size_t each = (size < _buf->Capacity()) ? size : _buf->Capacity();
@@ -877,6 +941,25 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                      aligned, z,
                                      static_cast<AlignedBuffer*>(dbg->buf_),
                                      dbg->file_advance_, dbg->leftover_tail_));
+}
+
+static void BGWorkAppendWAL(char *data, size_t size,
+                         Zone *zone, ZoneFile* zonefile) {
+  IOStatus s;
+
+  s = zone->Append(data, size);
+  if (!s.ok()) {
+    printf("pwrite() failed, zone=%ld\n", zone->GetZoneId());
+    abort();
+  }
+
+  if (zone->capacity_ < size) {
+    zone->Finish();
+    zone->zbd_->active_zones_--;
+    zone->zbd_->zone_tokens_.push(true);
+  } else {
+    zonefile->zones_.push(zone);
+  }
 }
 
 static void BGWorkAppend(char *data, size_t size,

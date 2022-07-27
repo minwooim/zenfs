@@ -128,6 +128,7 @@ class ZoneFile {
 
  public:
   bool deleted_;
+  tbb::concurrent_queue<Zone*> zones_;
 };
 
 class ZonedWritableFile : public FSWritableFile {
