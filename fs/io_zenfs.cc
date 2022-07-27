@@ -236,6 +236,14 @@ ZoneFile::~ZoneFile() {
     if (deleted_) {
       if (!zone->used_capacity_ && zone->finished_) {
         zone->Reset();
+      } else if (!zone->used_capacity_ && getFilename().substr(getFilename().size() - 3) == "log") {
+        if (!zone->finished_) {
+          zone->Reset();
+          zone->zbd_->active_zones_--;
+          zone->zbd_->zone_tokens_.push(true);
+        } else {
+          zone->Reset();
+        }
       }
     }
 
@@ -698,6 +706,7 @@ IOStatus ZonedWritableFile::Close(const IOOptions& options,
 IOStatus ZonedWritableFile::FlushBuffer() {
   uint32_t align, pad_sz = 0, wr_sz;
   IOStatus s;
+  IODebugContext* dbg;
 
   Debug(_logger, "ZonedWritableFile::FlushBuffer(): file=%s",
 		  zoneFile_->getFilename().c_str());
@@ -709,7 +718,13 @@ IOStatus ZonedWritableFile::FlushBuffer() {
   if (pad_sz) memset((char*)buffer + buffer_pos, 0x0, pad_sz);
 
   wr_sz = buffer_pos + pad_sz;
-  s = zoneFile_->Append((char*)buffer, wr_sz, buffer_pos);
+  if (zoneFile_->getFilename().substr(zoneFile_->getFilename().size() - 3) == "log") {
+    dbg = new IODebugContext();
+    dbg->for_wal_ = true;
+    zoneFile_->Append(buffer, wr_sz, dbg);
+  } else {
+    s = zoneFile_->Append((char*)buffer, wr_sz, buffer_pos);
+  }
   if (!s.ok()) {
     return s;
   }
@@ -729,6 +744,7 @@ IOStatus ZonedWritableFile::BufferedWrite(const Slice& slice) {
   int ret;
   void* alignbuf;
   IOStatus s;
+  IODebugContext* dbg;
 
   if (buffer_pos || data_left <= buffer_left) {
     if (data_left < buffer_left) {
@@ -761,7 +777,13 @@ IOStatus ZonedWritableFile::BufferedWrite(const Slice& slice) {
     }
 
     memcpy(alignbuf, data, aligned_sz);
-    s = zoneFile_->Append(alignbuf, aligned_sz, aligned_sz);
+    if (zoneFile_->getFilename().substr(zoneFile_->getFilename().size() - 3) == "log") {
+      dbg = new IODebugContext();
+      dbg->for_wal_ = true;
+      zoneFile_->Append(alignbuf, aligned_sz, dbg);
+    } else {
+      s = zoneFile_->Append(alignbuf, aligned_sz, aligned_sz);
+    }
     free(alignbuf);
 
     if (!s.ok()) return s;

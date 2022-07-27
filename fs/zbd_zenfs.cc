@@ -667,6 +667,9 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
   /* Try to fill an already open zone(with the best life time diff) */
   for (const auto z : io_zones) {
+    if (z->id_ >= ZSG_START_ZONE) {
+      break;
+    }
     if (z->Acquire()) {
       if ((z->used_capacity_ > 0) && !z->IsFull()) {
         unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
@@ -707,6 +710,9 @@ IOStatus ZonedBlockDevice::AllocateZone(Env::WriteLifeTimeHint file_lifetime,
 
     if (active_io_zones_.load() < max_nr_active_io_zones_) {
       for (const auto z : io_zones) {
+        if (z->id_ >= ZSG_START_ZONE) {
+          break;
+        }
         if (z->Acquire()) {
           if (z->IsEmpty()) {
             z->lifetime_ = file_lifetime;
@@ -842,6 +848,25 @@ bool ZonedBlockDevice::GetFreeZone(Zone*& zone, int level) {
   return GetFreeZoneFromSpare(zone, level);
 }
 
+bool ZonedBlockDevice::AllocateZSGZoneWAL(Zone*& zone, ZoneFile* zonefile) {
+  bool token;
+
+  if (GetPartialZone(zone, zonefile)) {
+    return true;
+  }
+
+  if (!zone_tokens_.try_pop(token)) {
+    return false;
+  }
+
+  if (!GetFreeZone(zone, ZSG_NR_LEVELS)) {
+    zone_tokens_.push(token);
+    return false;
+  }
+
+  return true;
+}
+
 bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone, ZoneFile* zonefile) {
   bool token;
   Env::WriteLifeTimeHint lifetime = zonefile->GetWriteLifeTimeHint();
@@ -873,9 +898,34 @@ bool ZonedBlockDevice::AllocateZSGZone(Zone*& zone, ZoneFile* zonefile) {
   return true;
 }
 
+static void BGWorkAppendWAL(char *data, size_t size,
+                         Zone *zone, ZoneFile* zonefile);
 static void BGWorkAppend(char *data, size_t size,
                          Zone *zone, ZoneFile* zonefile, AlignedBuffer *buf,
                          size_t file_advance, size_t leftover_tail);
+
+void ZoneStripingGroup::AppendWAL(ZoneFile *zonefile, void *data, size_t size) {
+  // 128KB * 8zones = 1MB (by default)
+  const int nr_zones = 8;
+  const size_t each = size / nr_zones;
+  Zone* z;
+  char* _data = static_cast<char*>(data);
+
+  for (int i = 0; i < nr_zones; i++) {
+    while (!zbd_->AllocateZSGZoneWAL(z, zonefile));
+
+    zonefile->PushExtent(new ZoneExtent(z->extent_start_, each, z));
+    z->extent_start_ = z->wp_ + each;
+    z->used_capacity_ += each;
+    thread_pool_.push_back(std::thread(BGWorkAppendWAL, _data + i * each,
+                                       each, z, zonefile));
+  }
+
+  for (auto& thread : thread_pool_) {
+    thread.join();
+  }
+  thread_pool_.clear();
+}
 
 void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                IODebugContext *dbg) {
@@ -884,6 +934,12 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
   size_t aligned = (each + (block_size - 1)) & ~(block_size - 1);
   char *_data = (char *) data;
   Zone* z;
+
+  if (dbg->for_wal_) {
+    // size = 1MB by default
+    AppendWAL(zonefile, data, size);
+    return;
+  }
 
   while (!zbd_->AllocateZSGZone(z, zonefile)) {
     ;
@@ -901,6 +957,25 @@ void ZoneStripingGroup::Append(ZoneFile *zonefile, void *data, size_t size,
                                      aligned, z, zonefile,
                                      static_cast<AlignedBuffer*>(dbg->buf_),
                                      dbg->file_advance_, dbg->leftover_tail_));
+}
+
+static void BGWorkAppendWAL(char *data, size_t size,
+                         Zone *zone, ZoneFile* zonefile) {
+  IOStatus s;
+
+  s = zone->Append(data, size);
+  if (!s.ok()) {
+    printf("pwrite() failed, zone=%ld\n", zone->GetZoneId());
+    abort();
+  }
+
+  if (zone->capacity_ < size) {
+    zone->Finish();
+    zone->zbd_->active_zones_--;
+    zone->zbd_->zone_tokens_.push(true);
+  } else {
+    zonefile->zones_.push(zone);
+  }
 }
 
 static void BGWorkAppend(char *data, size_t size,
@@ -940,6 +1015,10 @@ void ZoneStripingGroup::Fsync(ZoneFile* zonefile) {
   thread_pool_.clear();
 
   SetState(ZSGState::kFull);
+
+  if (zonefile->getFilename().substr(zonefile->getFilename().size() - 3) == "log") {
+    return;
+  }
 
   Zone* z;
   ZonedBlockDevice* zbd = zonefile->GetZbd();
