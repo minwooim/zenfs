@@ -36,7 +36,7 @@
 
 #define ZSG_NR_ZONES      (40704)
 // Actual size of a SSTable
-#define ZSG_START_ZONE    (16)
+#define ZSG_START_ZONE    (128)
 #define ZSG_MAX_ACTIVE_ZONES  (256)
 // Column family options. We just give hard-coded value along with db_bench
 #define ZSG_NR_LEVELS     (5) // default: 7
@@ -161,6 +161,7 @@ class ZoneStripingGroup {
   }
 
   // IOStatus BGWorkAppend(int i, char *data, size_t size);
+  void AppendWAL(ZoneFile *zonefile, void *data, size_t size);
   void Append(ZoneFile *zonefile, void *data, size_t size, IODebugContext *dbg);
   void Fsync(ZoneFile *zonefile);
 };
@@ -276,6 +277,7 @@ class ZonedBlockDevice {
   void PutZone(Zone* z);
   bool BusyZone(Zone* z);
 
+  bool AllocateZSGZoneWAL(Zone*& zone, ZoneFile* zonefile);
   bool AllocateZSGZone(Zone*& zone, ZoneFile* zonefile);
   bool GetPartialZone(Zone*& zone, ZoneFile* zonefile);
   bool GetPartialZone(Zone*& zone, int level);
@@ -292,6 +294,7 @@ class ZonedBlockDevice {
   tbb::concurrent_queue<bool> zone_tokens_;
   std::vector<tbb::concurrent_queue<Zone*>*> free_zones_;
   std::vector<tbb::concurrent_queue<Zone*>*> partial_zones_;
+  std::vector<tbb::concurrent_queue<Zone*>*> wal_zones_;
   CK_BITMAP_INSTANCE(ZSG_NR_ZONES) zone_bitmap_;
 };
 
